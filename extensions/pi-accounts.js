@@ -4,6 +4,11 @@ import { isAbsolute, join, resolve } from "node:path";
 import { AccountManager } from "./lib/account-manager.js";
 import { AccountStore } from "./lib/account-store.js";
 import {
+	formatOpenAiRateLimitStatus,
+	isGptModel,
+	parseOpenAiRateLimits,
+} from "./lib/api-rate-limits.js";
+import {
 	ACCOUNT_STORE_FILENAME,
 	CODEX_API,
 	CODEX_PROVIDER,
@@ -14,7 +19,12 @@ import {
 } from "./lib/constants.js";
 import { asText, maskEmail, validateAlias } from "./lib/credentials.js";
 import { BASE_PROVIDER_SYMBOL, createManagedProvider } from "./lib/managed-provider.js";
-import { formatQuotaCompact, formatQuotaDetails, formatRemainingTime } from "./lib/quota.js";
+import {
+	formatQuotaDetails,
+	formatQuotaFooter,
+	formatQuotaStatus,
+	formatRemainingTime,
+} from "./lib/quota.js";
 
 export function resolvePiAgentDir(env = process.env, home = homedir()) {
 	const configured = asText(env.PI_CODING_AGENT_DIR);
@@ -35,15 +45,34 @@ function notify(ctx, message, type = "info") {
 	ctx.ui.notify(message, type);
 }
 
-function formatFooter(view) {
+function activeAccount(view) {
+	return view.accounts.find((account) => account.active) ?? view.accounts[0];
+}
+
+function formatFooter(view, now = Date.now()) {
 	if (view.accounts.length === 0) return "accounts: /account add";
-	const active = view.accounts.find((account) => account.active) ?? view.accounts[0];
-	const quota = formatQuotaCompact(active.quota);
+	const active = activeAccount(view);
+	const quota = formatQuotaFooter(active.quota, now);
 	if (quota) return `${active.alias} · ${quota}`;
 	if (active.cooldown) {
-		return `${active.alias} · ${active.cooldown.kind} ${formatRemainingTime(active.cooldown.until - Date.now())}`;
+		return `${active.alias} · ${active.cooldown.kind} ${formatRemainingTime(active.cooldown.until - now)}`;
 	}
 	return `${active.alias} · quota unavailable`;
+}
+
+function formatCodexStatus(view, now = Date.now()) {
+	const active = activeAccount(view);
+	if (!active) return undefined;
+	const details = formatQuotaStatus(active.quota, now);
+	if (!details) return undefined;
+	const identity = [asText(active.email)?.slice(0, 80), asText(active.quota?.planType)?.slice(0, 24)]
+		.filter(Boolean)
+		.join(", ");
+	return `Codex ${active.alias}${identity ? ` (${identity})` : ""}: ${details}`;
+}
+
+function modelKey(model) {
+	return [model?.provider, model?.api, model?.id].map((value) => String(value ?? "")).join("\u0000");
 }
 
 function formatAccountList(view) {
@@ -133,6 +162,8 @@ export function createPiAccountsExtension(options = {}) {
 		let baseProvider;
 		let pollTimer;
 		let shuttingDown = false;
+		let apiRateLimits;
+		const now = () => options.now?.() ?? Date.now();
 
 		const manager =
 			options.manager ??
@@ -149,12 +180,48 @@ export function createPiAccountsExtension(options = {}) {
 			});
 
 		async function updateFooter(ctx) {
-			if (ctx.hasUI === false || shuttingDown) return;
+			if (ctx.hasUI === false || shuttingDown) return undefined;
 			try {
-				ctx.ui.setStatus(STATUS_KEY, formatFooter(await manager.getView()));
-			} catch {
-				// A broken footer must not affect account switching.
+				ctx.ui.setStatus(STATUS_KEY, formatFooter(await manager.getView(), now()));
+				return undefined;
+			} catch (error) {
+				return (
+					asText(error instanceof Error ? error.message : String(error))?.slice(0, 200) ??
+					"unknown footer status error"
+				);
 			}
+		}
+
+		async function showQuotaStatus(ctx) {
+			if (!isGptModel(ctx.model)) {
+				notify(ctx, "No GPT model is active.");
+				return;
+			}
+			if (isCodexModel(ctx.model)) {
+				await manager.refreshAll({ force: true, signal: ctx.signal });
+				const view = await manager.getView();
+				const footerError = await updateFooter(ctx);
+				const details = formatCodexStatus(view, now());
+				if (details) {
+					notify(
+						ctx,
+						footerError ? `${details}\nFooter status error: ${footerError}` : details,
+						footerError ? "warning" : "info",
+					);
+					return;
+				}
+				notify(ctx, "Codex quota data is unavailable.", "warning");
+				return;
+			}
+			const details =
+				apiRateLimits?.modelKey === modelKey(ctx.model)
+					? formatOpenAiRateLimitStatus(apiRateLimits.snapshot)
+					: undefined;
+			notify(
+				ctx,
+				details ?? "GPT API quota data is unavailable. Send a request to refresh it.",
+				details ? "info" : "warning",
+			);
 		}
 
 		async function refreshModelRegistry(ctx) {
@@ -305,10 +372,18 @@ export function createPiAccountsExtension(options = {}) {
 			...commandOptions,
 			description: "List or manage ChatGPT Codex accounts",
 		});
+		pi.registerCommand("status", {
+			description: "Show detailed GPT quota status",
+			handler: async (_args, ctx) => {
+				currentContext = ctx;
+				await showQuotaStatus(ctx);
+			},
+		});
 
 		pi.on("session_start", async (_event, ctx) => {
 			shuttingDown = false;
 			currentContext = ctx;
+			apiRateLimits = undefined;
 			const provider = ctx.modelRegistry.getProvider(CODEX_PROVIDER);
 			if (!provider) {
 				notify(ctx, "pi-accounts could not find Pi's openai-codex provider.", "error");
@@ -345,7 +420,15 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("model_select", async (_event, ctx) => {
 			currentContext = ctx;
+			apiRateLimits = undefined;
 			await updateFooter(ctx);
+		});
+
+		pi.on("after_provider_response", (event, ctx) => {
+			currentContext = ctx;
+			if (ctx.hasUI === false || !isGptModel(ctx.model) || isCodexModel(ctx.model)) return;
+			const snapshot = parseOpenAiRateLimits(event.headers);
+			if (snapshot) apiRateLimits = { modelKey: modelKey(ctx.model), snapshot };
 		});
 
 		pi.on("agent_end", (_event, ctx) => {
@@ -357,6 +440,7 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("session_shutdown", (_event, ctx) => {
 			shuttingDown = true;
+			apiRateLimits = undefined;
 			if (pollTimer) clearInterval(pollTimer);
 			pollTimer = undefined;
 			if (ctx.hasUI !== false) {

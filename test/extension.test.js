@@ -19,6 +19,7 @@ test("registers commands, logs in another account, updates the footer, and suppo
 	const statuses = [];
 	const notifications = [];
 	const widgets = [];
+	let footerFailure = false;
 	const baseProvider = {
 		id: "openai-codex",
 		name: "OpenAI Codex",
@@ -73,6 +74,7 @@ test("registers commands, logs in another account, updates the footer, and suppo
 		},
 		ui: {
 			setStatus(key, text) {
+				if (footerFailure) throw new Error("status unavailable");
 				statuses.push({ key, text });
 			},
 			notify(message, type) {
@@ -107,20 +109,62 @@ test("registers commands, logs in another account, updates the footer, and suppo
 
 		assert.equal(commands.has("account"), true);
 		assert.equal(commands.has("accounts"), true);
+		assert.equal(commands.get("status").description, "Show detailed GPT quota status");
 		await events.get("session_start")({}, ctx);
 		assert.equal(providers.length, 1);
 		assert.equal(providers[0].id, "openai-codex");
-		assert.match(statuses.at(-1).text, /^alpha · 5h 80% · 7d 90%$/);
+		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
 
 		await commands.get("account").handler("add beta", ctx);
 		assert.equal(widgets.some((entry) => entry.content?.includes("Device code: ABCD-EFGH")), true);
-		assert.match(statuses.at(-1).text, /^beta · 5h 70% · 7d 90%$/);
+		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
 		assert.equal(notifications.some((entry) => /Added and selected Codex account "beta"/.test(entry.message)), true);
 
 		await commands.get("account").handler("use alpha", ctx);
-		assert.match(statuses.at(-1).text, /^alpha · 5h 80% · 7d 90%$/);
+		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
+
+		await commands.get("status").handler("", ctx);
+		assert.equal(
+			notifications.some(
+				(entry) =>
+					entry.message ===
+					"Codex alpha (alpha@example.com): 5h 80% left, reset 1h | 7d 90% left, reset 1d",
+			),
+			true,
+		);
+
+		footerFailure = true;
+		await commands.get("status").handler("", ctx);
+		assert.equal(
+			notifications.some(
+				(entry) =>
+					entry.type === "warning" &&
+					entry.message.endsWith("\nFooter status error: status unavailable"),
+			),
+			true,
+		);
+		footerFailure = false;
+
+		ctx.model = { provider: "openai", id: "gpt-5.4", api: "openai-responses" };
+		await events.get("model_select")({}, ctx);
+		events.get("after_provider_response")(
+			{
+				headers: {
+					"x-ratelimit-remaining-requests": "42",
+					"x-ratelimit-reset-requests": "2s",
+					"x-ratelimit-remaining-tokens": "149984",
+					"x-ratelimit-reset-tokens": "6m0s",
+				},
+			},
+			ctx,
+		);
+		await commands.get("status").handler("", ctx);
+		assert.deepEqual(notifications.at(-1), {
+			message: "GPT API: requests 42 left, reset 2s | tokens 149,984 left, reset 6m0s",
+			type: "info",
+		});
 	} finally {
 		events.get("session_shutdown")?.({}, ctx);
 		await rm(agentDir, { recursive: true, force: true });

@@ -155,6 +155,22 @@ function formatWindow(window, fallback, now, includeReset) {
 	return `${label} ${remaining}%${resetAt ? ` (reset ${formatRemainingTime(resetAt - now)})` : ""}`;
 }
 
+function formatWindowVerbose(window, fallback, now) {
+	const remaining = quotaRemainingPercent(window);
+	if (remaining === undefined) return undefined;
+	const label = formatWindowLength(window.windowSeconds, fallback);
+	const resetAt = getWindowResetAt(window, now);
+	return `${label} ${remaining}% left${resetAt ? `, reset ${formatRemainingTime(resetAt - now)}` : ""}`;
+}
+
+function formatResetTimeCompact(milliseconds) {
+	const totalMinutes = Math.max(1, Math.ceil(Math.max(0, milliseconds) / 60_000));
+	if (totalMinutes < 60) return `${totalMinutes}m`;
+	const totalHours = Math.ceil(totalMinutes / 60);
+	if (totalHours < 24) return `${totalHours}h`;
+	return `${Math.ceil(totalHours / 24)}d`;
+}
+
 export function formatQuotaCompact(snapshot, now = Date.now()) {
 	if (!snapshot) return undefined;
 	const windows = [
@@ -162,6 +178,26 @@ export function formatQuotaCompact(snapshot, now = Date.now()) {
 		formatWindow(snapshot.secondary, "secondary", now, false),
 	].filter(Boolean);
 	return windows.length > 0 ? windows.join(" · ") : undefined;
+}
+
+export function formatQuotaFooter(snapshot, now = Date.now()) {
+	const quota = formatQuotaCompact(snapshot, now);
+	if (!quota) return undefined;
+	const resetAt = [snapshot?.primary, snapshot?.secondary]
+		.map((window) => (window ? getWindowResetAt(window, now) : undefined))
+		.filter((value) => value !== undefined && value > now)
+		.sort((left, right) => left - right)[0];
+	return resetAt ? `${quota} · ${formatResetTimeCompact(resetAt - now)}` : quota;
+}
+
+export function formatQuotaStatus(snapshot, now = Date.now()) {
+	if (!snapshot) return undefined;
+	const parts = [
+		formatWindowVerbose(snapshot.primary, "primary", now),
+		formatWindowVerbose(snapshot.secondary, "secondary", now),
+	].filter(Boolean);
+	if (snapshot.resetCredits !== undefined) parts.push(`reset credits ${snapshot.resetCredits}`);
+	return parts.length > 0 ? parts.join(" | ") : undefined;
 }
 
 export function formatQuotaDetails(snapshot, now = Date.now()) {

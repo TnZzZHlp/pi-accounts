@@ -5,6 +5,8 @@ import {
 	fetchCodexUsage,
 	formatQuotaCompact,
 	formatQuotaDetails,
+	formatQuotaFooter,
+	formatQuotaStatus,
 	formatRemainingTime,
 	getQuotaResetAt,
 	isQuotaExhausted,
@@ -27,6 +29,14 @@ test("normalizes and formats five-hour and seven-day Codex quota", () => {
 		formatQuotaDetails(snapshot, NOW),
 		"5h 75% (reset 1h) | 7d 17% (reset 1d)",
 	);
+	assert.equal(
+		formatQuotaFooter(snapshot, NOW),
+		"5h 75% · 7d 17% · 1h",
+	);
+	assert.equal(
+		formatQuotaStatus({ ...snapshot, resetCredits: 2 }, NOW),
+		"5h 75% left, reset 1h | 7d 17% left, reset 1d | reset credits 2",
+	);
 	assert.equal(isQuotaExhausted(snapshot), false);
 	assert.equal(formatRemainingTime((2 * 24 * 60 + 3 * 60 + 4) * 60_000), "2d 3h 4m");
 });
@@ -44,6 +54,23 @@ test("parses legacy Codex response headers", () => {
 		"x-codex-primary-reset-at": String(NOW / 1000 + 3600),
 	});
 	assert.equal(formatQuotaCompact(snapshot, NOW), "5h 50%");
+});
+
+test("labels single Codex windows by their reported duration", () => {
+	assert.equal(
+		formatQuotaFooter(
+			{
+				primary: {
+					usedPercent: 4,
+					windowSeconds: 7 * 24 * 60 * 60,
+					resetAt: NOW + (4 * 24 * 60 + 2 * 60 + 3) * 60_000,
+				},
+			},
+			NOW,
+		),
+		"7d 96% · 5d",
+	);
+	assert.equal(formatQuotaFooter({ primary: {} }, NOW), undefined);
 });
 
 test("fetches quota with the selected account token and id", async () => {

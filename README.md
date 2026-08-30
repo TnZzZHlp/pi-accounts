@@ -2,7 +2,7 @@
 
 `pi-accounts` 是一个面向 [Pi coding agent](https://github.com/earendil-works/pi-mono) 的 ChatGPT Codex 多账号扩展。
 
-它可以同时保存多个 `openai-codex` OAuth 登录，在当前账号的五小时或七天额度耗尽时自动切换，并在 Pi 底栏持续显示当前账号别名和剩余额度。也可以用 `/account use <alias>` 手动指定下一次请求使用的账号。
+它可以同时保存多个 `openai-codex` OAuth 登录，在当前账号的五小时或七天额度耗尽时自动切换，并在 Pi 底栏持续显示当前账号别名、剩余额度和最近一次重置倒计时。也可以用 `/account use <alias>` 手动指定下一次请求使用的账号。
 
 ## 功能
 
@@ -11,7 +11,9 @@
 - 主动读取当前账号的订阅额度，额度耗尽时按账号顺序轮换。
 - 请求收到 HTTP 429 或明确的 usage-limit 错误时，在尚未输出内容的前提下使用下一个账号无缝重试。
 - 对 SSE、WebSocket 和 WebSocket 缓存传输都传入真正选中的 access token，避免复用旧账号连接。
-- 底栏示例：`work · 5h 72% · 7d 41%`。
+- 底栏示例：`work · 5h 72% · 7d 41% · 2h`；最后一项只显示最近的 reset 时间。
+- `/status` 显示当前 Codex 账号的完整额度、重置时间、reset credits 和本地账号标识。
+- 使用 API key 的其他 GPT 模型会从 provider 响应中读取标准 `x-ratelimit-*` 请求及 Token 限额，并通过 `/status` 显示。
 - 使用文件锁和原子写入保护多进程下的账号文件及 Pi `auth.json`。
 
 ## 安装
@@ -36,6 +38,12 @@ pi -e /absolute/path/to/pi-accounts
 
 安装后重新启动 Pi；已有交互会话可以运行 `/reload`。
 
+如果此前安装过已合并进本项目的 `pi-gpt-quota-status`，请移除旧包以避免重复页脚：
+
+```bash
+pi remove git:github.com/TnZzZHlp/pi-gpt-quota-status
+```
+
 ## 使用
 
 当前 Pi 登录会在扩展启动时自动成为第一个托管账号。添加第二个账号：
@@ -57,12 +65,14 @@ pi -e /absolute/path/to/pi-accounts
 /account auto
 /account rename <old> <new>
 /account remove <alias>
+/status
 ```
 
 - `/account use` 会立即把指定账号设为当前账号；如果它之后达到额度限制，自动故障转移仍然有效。
 - `/account auto` 会刷新所有账号额度并选择一个可用账号。
 - `/account remove` 会先确认，再删除该账号的本地 OAuth 凭据。删除最后一个账号时只移除 `auth.json` 中的 `openai-codex` 登录，不影响其他 provider。
 - `/accounts` 是 `/account` 的别名。
+- Codex 模型下的 `/status` 会立即刷新额度并显示当前账号详情；其他 GPT 模型需要先发送一次请求，再用 `/status` 查看 provider 返回的请求数和 Token 限额。
 
 ## 自动切换语义
 
@@ -80,7 +90,7 @@ pi -e /absolute/path/to/pi-accounts
 
 如果设置了 `PI_CODING_AGENT_DIR`，则存放在该目录下。文件包含 OAuth access token 和 refresh token，权限为仅当前用户可读写，保护级别与 Pi 的 `auth.json` 相同。不要提交、复制或分享此文件。
 
-扩展不会记录 token。额度请求只把所选账号的 access token 和 token 内的 ChatGPT account id 发送到 ChatGPT 的 usage endpoint。账号列表只显示别名和掩码后的邮箱。
+扩展不会记录 token。额度请求只把所选账号的 access token 和 token 内的 ChatGPT account id 发送到 ChatGPT 的 usage endpoint。账号列表只显示别名和掩码后的邮箱；`/status` 会在本地通知中显示当前账号的完整邮箱，与旧额度扩展的行为一致。
 
 底层 usage endpoint 和 Pi provider 接口可能随上游版本变化。当前实现和测试基线是 Pi `0.84.4`。[OpenAI 官方文档](https://learn.chatgpt.com/docs/security/cli#sign-in)确认 ChatGPT 登录用于订阅访问，但并未把第三方多账号轮换描述为官方 Codex 功能；使用时应遵守适用于各账号的服务条款和组织策略。
 
@@ -91,4 +101,4 @@ npm install
 npm test
 ```
 
-测试覆盖额度解析、凭据导入与同步、手动选择、账号删除、并发 OAuth token 刷新，以及 429 后换号重试。
+测试覆盖 Codex 与普通 GPT API 限额解析、`/status`、页脚、凭据导入与同步、手动选择、账号删除、并发 OAuth token 刷新，以及 429 后换号重试。
