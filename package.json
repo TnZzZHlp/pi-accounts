@@ -1,0 +1,44 @@
+{
+  "name": "pi-accounts",
+  "version": "0.1.0",
+  "description": "Multi-account ChatGPT Codex OAuth management and automatic quota failover for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TnZzZHlp/pi-accounts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TnZzZHlp/pi-accounts/issues"
+  },
+  "homepage": "https://github.com/TnZzZHlp/pi-accounts#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "codex",
+    "oauth",
+    "multi-account",
+    "quota"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage"
+  },
+  "dependencies": {
+    "proper-lockfile": "4.1.2"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-accounts.js"
+    ]
+  }
+}
