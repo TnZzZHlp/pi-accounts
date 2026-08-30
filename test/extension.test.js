@@ -7,7 +7,7 @@ import test from "node:test";
 import { createPiAccountsExtension, resolvePiAgentDir } from "../extensions/pi-accounts.js";
 import { createCredential, NOW, quotaPayload } from "./helpers.js";
 
-test("registers commands, logs in another account, updates the footer, and supports manual selection", async () => {
+test("registers commands and drives account management through the interactive TUI", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-accounts-extension-"));
 	const alpha = createCredential("alpha", { email: "alpha@example.com" });
 	const beta = createCredential("beta", { email: "beta@example.com" });
@@ -19,6 +19,8 @@ test("registers commands, logs in another account, updates the footer, and suppo
 	const statuses = [];
 	const notifications = [];
 	const widgets = [];
+	const selectResponses = [];
+	const inputResponses = [];
 	let footerFailure = false;
 	const baseProvider = {
 		id: "openai-codex",
@@ -83,11 +85,14 @@ test("registers commands, logs in another account, updates the footer, and suppo
 			setWidget(key, content) {
 				widgets.push({ key, content });
 			},
-			select(_title, options) {
-				return Promise.resolve(options[0]);
+			select(title, options) {
+				const response = selectResponses.shift();
+				return Promise.resolve(
+					typeof response === "function" ? response({ title, options }) : (response ?? options[0]),
+				);
 			},
 			input() {
-				return Promise.resolve("");
+				return Promise.resolve(inputResponses.shift() ?? "");
 			},
 			confirm() {
 				return Promise.resolve(true);
@@ -124,6 +129,42 @@ test("registers commands, logs in another account, updates the footer, and suppo
 		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
+
+		selectResponses.push(
+			({ title, options }) => {
+				assert.equal(title, "Codex account manager");
+				return options.find((option) => option.includes("beta"));
+			},
+			"Use this account",
+			"Close",
+		);
+		await commands.get("account").handler("", ctx);
+		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
+		assert.equal(notifications.some((entry) => /Selected Codex account "beta"/.test(entry.message)), true);
+		await commands.get("account").handler("use alpha", ctx);
+
+		selectResponses.push("Refresh all quotas", "Auto-select an available account", "Close");
+		await commands.get("account").handler("tui", ctx);
+		assert.equal(notifications.some((entry) => /Refreshing Codex account quotas/.test(entry.message)), true);
+		assert.equal(notifications.some((entry) => /Auto-selected Codex account/.test(entry.message)), true);
+
+		selectResponses.push(
+			({ options }) => options.find((option) => option.includes("beta")),
+			"Rename account",
+			"Close",
+		);
+		inputResponses.push("personal");
+		await commands.get("accounts").handler("manage", ctx);
+		await commands.get("account").handler("list", ctx);
+		assert.equal(notifications.some((entry) => /personal/.test(entry.message)), true);
+
+		selectResponses.push(
+			({ options }) => options.find((option) => option.includes("personal")),
+			"Remove account",
+			"Close",
+		);
+		await commands.get("account").handler("", ctx);
+		assert.equal(notifications.some((entry) => /Removed Codex account "personal"/.test(entry.message)), true);
 
 		await commands.get("status").handler("", ctx);
 		assert.equal(

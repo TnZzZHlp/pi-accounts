@@ -90,6 +90,18 @@ function formatAccountList(view) {
 	return [`Codex accounts (${view.accounts.length}):`, ...lines].join("\n");
 }
 
+function formatTuiAccount(account, now = Date.now()) {
+	const marker = account.active ? "*" : " ";
+	const identity = maskEmail(account.email);
+	const quota = formatQuotaFooter(account.quota, now);
+	const availability =
+		quota ??
+		(account.cooldown
+			? `${account.cooldown.kind} ${formatRemainingTime(account.cooldown.until - now)}`
+			: "quota unavailable");
+	return `${marker} ${account.alias}${identity ? ` (${identity})` : ""} · ${availability}`;
+}
+
 function formatAuthEvent(event) {
 	if (event.type === "auth_url") {
 		return [event.instructions, event.url].filter(Boolean);
@@ -138,11 +150,12 @@ function parseCommand(args) {
 		.trim()
 		.split(/\s+/)
 		.filter(Boolean);
-	return { subcommand: (parts.shift() ?? "list").toLowerCase(), args: parts };
+	return { subcommand: parts.shift()?.toLowerCase(), args: parts };
 }
 
 function commandHelp() {
 	return [
+		"/account — open the interactive account manager",
 		"/account list — list accounts and quota",
 		"/account add [alias] — sign in to another ChatGPT Codex account",
 		"/account import [alias] — import Pi's current openai-codex login",
@@ -261,11 +274,154 @@ export function createPiAccountsExtension(options = {}) {
 			}
 		}
 
+		async function selectAccount(ctx, alias) {
+			const account = await manager.use(alias);
+			await refreshModelRegistry(ctx);
+			await updateFooter(ctx);
+			notify(
+				ctx,
+				`Selected Codex account "${account.alias}"${ctx.isIdle() ? "." : " for the next provider request."}`,
+			);
+			return account;
+		}
+
+		async function renameAccount(ctx, oldAlias, newAlias) {
+			const account = await manager.rename(oldAlias, newAlias);
+			await updateFooter(ctx);
+			notify(ctx, `Renamed Codex account to "${account.alias}".`);
+			return account;
+		}
+
+		async function removeAccount(ctx, alias) {
+			if (ctx.hasUI === false) throw new Error("Removing an account requires interactive or RPC UI");
+			const confirmed = await ctx.ui.confirm(
+				"Remove Codex account",
+				`Delete the locally stored OAuth credentials for "${alias}"?`,
+			);
+			if (!confirmed) {
+				notify(ctx, "Account removal cancelled.");
+				return undefined;
+			}
+			const account = await manager.remove(alias);
+			await refreshModelRegistry(ctx);
+			await updateFooter(ctx);
+			notify(ctx, `Removed Codex account "${account.alias}".`, "warning");
+			return account;
+		}
+
+		async function showAccountActions(ctx, initialAlias) {
+			let alias = initialAlias;
+			while (true) {
+				const view = await manager.getView();
+				const account = view.accounts.find((candidate) => candidate.alias === alias);
+				if (!account) return;
+				const details = formatQuotaDetails(account.quota, now());
+				const choices = [
+					...(account.active ? [] : ["Use this account"]),
+					"Rename account",
+					"Remove account",
+					"Back",
+				];
+				const choice = await ctx.ui.select(
+					`Account "${account.alias}"${account.active ? " (active)" : ""} — ${details}`,
+					choices,
+				);
+				if (choice === undefined || choice === "Back") return;
+				if (choice === "Use this account") {
+					await selectAccount(ctx, account.alias);
+					return;
+				}
+				if (choice === "Rename account") {
+					const value = await ctx.ui.input("Rename Codex account", account.alias);
+					if (value === undefined || value.trim() === "" || value === account.alias) continue;
+					const renamed = await renameAccount(ctx, account.alias, value);
+					alias = renamed.alias;
+					return;
+				}
+				if (choice === "Remove account") {
+					await removeAccount(ctx, account.alias);
+					return;
+				}
+			}
+		}
+
+		async function showAccountTui(ctx) {
+			if (ctx.hasUI === false) throw new Error("The account manager requires TUI or RPC UI");
+			const refreshLabel = "Refresh all quotas";
+			const autoLabel = "Auto-select an available account";
+			const addLabel = "Add another Codex login";
+			const importLabel = "Import Pi's current Codex login";
+			const closeLabel = "Close";
+			const initialView = await manager.getView();
+			if (initialView.accounts.some((account) => !account.quota)) {
+				await manager.refreshAll({ force: false });
+				await updateFooter(ctx);
+			}
+			while (true) {
+				const view = await manager.getView();
+				const orderedAccounts = [...view.accounts].sort(
+					(left, right) => Number(right.active) - Number(left.active),
+				);
+				const accountOptions = new Map(
+					orderedAccounts.map((account) => [formatTuiAccount(account, now()), account.alias]),
+				);
+				const choice = await ctx.ui.select("Codex account manager", [
+					...accountOptions.keys(),
+					refreshLabel,
+					autoLabel,
+					addLabel,
+					importLabel,
+					closeLabel,
+				]);
+				if (choice === undefined || choice === closeLabel) return;
+				try {
+					const alias = accountOptions.get(choice);
+					if (alias) {
+						await showAccountActions(ctx, alias);
+						continue;
+					}
+					if (choice === refreshLabel) {
+						notify(ctx, "Refreshing Codex account quotas…");
+						await manager.refreshAll({ force: true });
+						await updateFooter(ctx);
+						continue;
+					}
+					if (choice === autoLabel) {
+						const account = await manager.chooseAuto();
+						await refreshModelRegistry(ctx);
+						await updateFooter(ctx);
+						notify(ctx, `Auto-selected Codex account "${account.alias}".`);
+						continue;
+					}
+					if (choice === addLabel) {
+						const value = await ctx.ui.input("Add Codex account", "optional alias");
+						if (value !== undefined) await addAccount(ctx, asText(value));
+						continue;
+					}
+					if (choice === importLabel) {
+						const value = await ctx.ui.input("Import current Codex login", "optional alias");
+						if (value === undefined) continue;
+						const account = await manager.importCurrent(asText(value), { makeActive: true });
+						await updateFooter(ctx);
+						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
+					}
+				} catch (error) {
+					notify(ctx, error instanceof Error ? error.message : String(error), "error");
+				}
+			}
+		}
+
 		async function handleAccountCommand(rawArgs, ctx) {
 			currentContext = ctx;
 			const parsed = parseCommand(rawArgs);
 			try {
 				switch (parsed.subcommand) {
+					case undefined:
+					case "tui":
+					case "menu":
+					case "manage":
+						await showAccountTui(ctx);
+						return;
 					case "list":
 					case "ls":
 						await showAccounts(ctx, false);
@@ -288,13 +444,7 @@ export function createPiAccountsExtension(options = {}) {
 					}
 					case "use": {
 						if (parsed.args.length !== 1) throw new Error("Usage: /account use <alias>");
-						const account = await manager.use(parsed.args[0]);
-						await refreshModelRegistry(ctx);
-						await updateFooter(ctx);
-						notify(
-							ctx,
-							`Selected Codex account "${account.alias}"${ctx.isIdle() ? "." : " for the next provider request."}`,
-						);
+						await selectAccount(ctx, parsed.args[0]);
 						return;
 					}
 					case "auto": {
@@ -306,27 +456,13 @@ export function createPiAccountsExtension(options = {}) {
 					}
 					case "rename": {
 						if (parsed.args.length !== 2) throw new Error("Usage: /account rename <old> <new>");
-						const account = await manager.rename(parsed.args[0], parsed.args[1]);
-						await updateFooter(ctx);
-						notify(ctx, `Renamed Codex account to "${account.alias}".`);
+						await renameAccount(ctx, parsed.args[0], parsed.args[1]);
 						return;
 					}
 					case "remove":
 					case "delete": {
 						if (parsed.args.length !== 1) throw new Error("Usage: /account remove <alias>");
-						if (ctx.hasUI === false) throw new Error("/account remove requires interactive or RPC UI");
-						const confirmed = await ctx.ui.confirm(
-							"Remove Codex account",
-							`Delete the locally stored OAuth credentials for "${parsed.args[0]}"?`,
-						);
-						if (!confirmed) {
-							notify(ctx, "Account removal cancelled.");
-							return;
-						}
-						const account = await manager.remove(parsed.args[0]);
-						await refreshModelRegistry(ctx);
-						await updateFooter(ctx);
-						notify(ctx, `Removed Codex account "${account.alias}".`, "warning");
+						await removeAccount(ctx, parsed.args[0]);
 						return;
 					}
 					case "help":
@@ -346,7 +482,7 @@ export function createPiAccountsExtension(options = {}) {
 		async function getArgumentCompletions(argumentPrefix) {
 			const prefix = String(argumentPrefix ?? "");
 			const tokens = prefix.trimStart().split(/\s+/);
-			const subcommands = ["list", "status", "add", "import", "use", "auto", "rename", "remove", "help"];
+			const subcommands = ["tui", "list", "status", "add", "import", "use", "auto", "rename", "remove", "help"];
 			if (tokens.length <= 1 && !prefix.endsWith(" ")) {
 				const needle = tokens[0]?.toLowerCase() ?? "";
 				return subcommands

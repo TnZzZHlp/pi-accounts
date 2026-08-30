@@ -1,7 +1,7 @@
 {
   "name": "pi-accounts",
-  "version": "0.2.0",
-  "description": "Multi-account ChatGPT Codex OAuth, quota status, and automatic failover for Pi.",
+  "version": "0.3.0",
+  "description": "Interactive multi-account ChatGPT Codex OAuth, quota status, and automatic failover for Pi.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -20,6 +20,7 @@
     "codex",
     "oauth",
     "multi-account",
+    "tui",
     "quota"
   ],
   "engines": {

@@ -14,6 +14,7 @@
 - 底栏示例：`work · 5h 72% · 7d 41% · 2h`；最后一项只显示最近的 reset 时间。
 - `/status` 显示当前 Codex 账号的完整额度、重置时间、reset credits 和本地账号标识。
 - 使用 API key 的其他 GPT 模型会从 provider 响应中读取标准 `x-ratelimit-*` 请求及 Token 限额，并通过 `/status` 显示。
+- `/account` 或 `/accounts` 不带参数会打开交互式 TUI，可直接查看、切换和管理账号。
 - 使用文件锁和原子写入保护多进程下的账号文件及 Pi `auth.json`。
 
 ## 安装
@@ -54,9 +55,18 @@ pi remove git:github.com/TnZzZHlp/pi-gpt-quota-status
 
 扩展会询问使用浏览器登录还是适合无头服务器的 device-code 登录。完成授权后，新账号会保存并设为当前账号。
 
-常用命令：
+直接打开交互式账号管理器：
 
 ```text
+/account
+```
+
+使用方向键选择账号或操作，Enter 确认，Escape 返回。TUI 支持刷新额度、自动选择可用账号、添加或导入登录，以及对账号进行切换、重命名和确认删除。
+
+也可以继续使用完整命令：
+
+```text
+/account tui
 /account list
 /account status
 /account add [alias]
@@ -69,6 +79,7 @@ pi remove git:github.com/TnZzZHlp/pi-gpt-quota-status
 ```
 
 - `/account use` 会立即把指定账号设为当前账号；如果它之后达到额度限制，自动故障转移仍然有效。
+- `/account tui`、`/account menu` 和 `/account manage` 与不带参数的 `/account` 等价。
 - `/account auto` 会刷新所有账号额度并选择一个可用账号。
 - `/account remove` 会先确认，再删除该账号的本地 OAuth 凭据。删除最后一个账号时只移除 `auth.json` 中的 `openai-codex` 登录，不影响其他 provider。
 - `/accounts` 是 `/account` 的别名。
@@ -101,4 +112,4 @@ npm install
 npm test
 ```
 
-测试覆盖 Codex 与普通 GPT API 限额解析、`/status`、页脚、凭据导入与同步、手动选择、账号删除、并发 OAuth token 刷新，以及 429 后换号重试。
+测试覆盖交互式 TUI、Codex 与普通 GPT API 限额解析、`/status`、页脚、凭据导入与同步、手动选择、账号删除、并发 OAuth token 刷新，以及 429 后换号重试。
