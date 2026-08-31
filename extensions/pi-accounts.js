@@ -50,7 +50,7 @@ function activeAccount(view) {
 }
 
 function formatFooter(view, now = Date.now()) {
-	if (view.accounts.length === 0) return "accounts: /account add";
+	if (view.accounts.length === 0) return "accounts: /accounts add";
 	const active = activeAccount(view);
 	const quota = formatQuotaFooter(active.quota, now);
 	if (quota) return `${active.alias} · ${quota}`;
@@ -76,7 +76,7 @@ function modelKey(model) {
 }
 
 function formatAccountList(view) {
-	if (view.accounts.length === 0) return "No managed Codex accounts. Run /account add [alias].";
+	if (view.accounts.length === 0) return "No managed Codex accounts. Run /accounts add [alias].";
 	const lines = view.accounts.map((account) => {
 		const marker = account.active ? "*" : " ";
 		const identity = maskEmail(account.email);
@@ -140,7 +140,6 @@ function createLoginInteraction(ctx, controller) {
 		notify(event) {
 			const lines = formatAuthEvent(event).filter(Boolean);
 			ctx.ui.setWidget(LOGIN_WIDGET_KEY, lines, { placement: "aboveEditor" });
-			notify(ctx, lines.join("\n"), event.type === "info" ? "info" : "warning");
 		},
 	};
 }
@@ -155,15 +154,16 @@ function parseCommand(args) {
 
 function commandHelp() {
 	return [
-		"/account — open the interactive account manager",
-		"/account list — list accounts and quota",
-		"/account add [alias] — sign in to another ChatGPT Codex account",
-		"/account import [alias] — import Pi's current openai-codex login",
-		"/account use <alias> — manually select the account used next",
-		"/account auto — select the next account with quota",
-		"/account status — refresh quota for every account",
-		"/account rename <old> <new> — rename an alias",
-		"/account remove <alias> — remove a stored account",
+		"/accounts — open the interactive account manager",
+		"/accounts list — list accounts and quota",
+		"/accounts add [alias] — sign in to another ChatGPT Codex account",
+		"/accounts import [alias] — import Pi's current openai-codex login",
+		"/accounts use <alias> — manually select the account used next",
+		"/accounts auto — select the next account with quota",
+		"/accounts refresh — refresh quota for every account",
+		"/accounts status — show detailed GPT quota status",
+		"/accounts rename <old> <new> — rename an alias",
+		"/accounts remove <alias> — remove a stored account",
 	].join("\n");
 }
 
@@ -253,7 +253,7 @@ export function createPiAccountsExtension(options = {}) {
 		}
 
 		async function addAccount(ctx, alias) {
-			if (ctx.hasUI === false) throw new Error("/account add requires interactive or RPC UI");
+			if (ctx.hasUI === false) throw new Error("/accounts add requires interactive or RPC UI");
 			if (alias !== undefined) validateAlias(alias);
 			const oauth = baseProvider?.auth?.oauth;
 			if (!oauth) throw new Error("OpenAI Codex OAuth is unavailable; run /reload and try again");
@@ -427,23 +427,25 @@ export function createPiAccountsExtension(options = {}) {
 						await showAccounts(ctx, false);
 						return;
 					case "status":
+						await showQuotaStatus(ctx);
+						return;
 					case "refresh":
 						await showAccounts(ctx, true);
 						return;
 					case "add":
 					case "login":
-						if (parsed.args.length > 1) throw new Error("Usage: /account add [alias]");
+						if (parsed.args.length > 1) throw new Error("Usage: /accounts add [alias]");
 						await addAccount(ctx, parsed.args[0]);
 						return;
 					case "import": {
-						if (parsed.args.length > 1) throw new Error("Usage: /account import [alias]");
+						if (parsed.args.length > 1) throw new Error("Usage: /accounts import [alias]");
 						const account = await manager.importCurrent(parsed.args[0], { makeActive: true });
 						await updateFooter(ctx);
 						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
 						return;
 					}
 					case "use": {
-						if (parsed.args.length !== 1) throw new Error("Usage: /account use <alias>");
+						if (parsed.args.length !== 1) throw new Error("Usage: /accounts use <alias>");
 						await selectAccount(ctx, parsed.args[0]);
 						return;
 					}
@@ -455,13 +457,13 @@ export function createPiAccountsExtension(options = {}) {
 						return;
 					}
 					case "rename": {
-						if (parsed.args.length !== 2) throw new Error("Usage: /account rename <old> <new>");
+						if (parsed.args.length !== 2) throw new Error("Usage: /accounts rename <old> <new>");
 						await renameAccount(ctx, parsed.args[0], parsed.args[1]);
 						return;
 					}
 					case "remove":
 					case "delete": {
-						if (parsed.args.length !== 1) throw new Error("Usage: /account remove <alias>");
+						if (parsed.args.length !== 1) throw new Error("Usage: /accounts remove <alias>");
 						await removeAccount(ctx, parsed.args[0]);
 						return;
 					}
@@ -471,7 +473,7 @@ export function createPiAccountsExtension(options = {}) {
 						notify(ctx, commandHelp());
 						return;
 					default:
-						throw new Error(`Unknown /account subcommand: ${parsed.subcommand}\n${commandHelp()}`);
+						throw new Error(`Unknown /accounts subcommand: ${parsed.subcommand}\n${commandHelp()}`);
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -482,7 +484,19 @@ export function createPiAccountsExtension(options = {}) {
 		async function getArgumentCompletions(argumentPrefix) {
 			const prefix = String(argumentPrefix ?? "");
 			const tokens = prefix.trimStart().split(/\s+/);
-			const subcommands = ["tui", "list", "status", "add", "import", "use", "auto", "rename", "remove", "help"];
+			const subcommands = [
+				"tui",
+				"list",
+				"refresh",
+				"status",
+				"add",
+				"import",
+				"use",
+				"auto",
+				"rename",
+				"remove",
+				"help",
+			];
 			if (tokens.length <= 1 && !prefix.endsWith(" ")) {
 				const needle = tokens[0]?.toLowerCase() ?? "";
 				return subcommands
@@ -503,18 +517,7 @@ export function createPiAccountsExtension(options = {}) {
 			getArgumentCompletions,
 			handler: handleAccountCommand,
 		};
-		pi.registerCommand("account", commandOptions);
-		pi.registerCommand("accounts", {
-			...commandOptions,
-			description: "List or manage ChatGPT Codex accounts",
-		});
-		pi.registerCommand("status", {
-			description: "Show detailed GPT quota status",
-			handler: async (_args, ctx) => {
-				currentContext = ctx;
-				await showQuotaStatus(ctx);
-			},
-		});
+		pi.registerCommand("accounts", commandOptions);
 
 		pi.on("session_start", async (_event, ctx) => {
 			shuttingDown = false;

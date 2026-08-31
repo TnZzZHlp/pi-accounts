@@ -112,20 +112,19 @@ test("registers commands and drives account management through the interactive T
 			},
 		})(pi);
 
-		assert.equal(commands.has("account"), true);
-		assert.equal(commands.has("accounts"), true);
-		assert.equal(commands.get("status").description, "Show detailed GPT quota status");
+		assert.deepEqual([...commands.keys()], ["accounts"]);
 		await events.get("session_start")({}, ctx);
 		assert.equal(providers.length, 1);
 		assert.equal(providers[0].id, "openai-codex");
 		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
 
-		await commands.get("account").handler("add beta", ctx);
+		await commands.get("accounts").handler("add beta", ctx);
 		assert.equal(widgets.some((entry) => entry.content?.includes("Device code: ABCD-EFGH")), true);
+		assert.equal(notifications.some((entry) => entry.message.includes("Device code: ABCD-EFGH")), false);
 		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
 		assert.equal(notifications.some((entry) => /Added and selected Codex account "beta"/.test(entry.message)), true);
 
-		await commands.get("account").handler("use alpha", ctx);
+		await commands.get("accounts").handler("use alpha", ctx);
 		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
@@ -138,13 +137,13 @@ test("registers commands and drives account management through the interactive T
 			"Use this account",
 			"Close",
 		);
-		await commands.get("account").handler("", ctx);
+		await commands.get("accounts").handler("", ctx);
 		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
 		assert.equal(notifications.some((entry) => /Selected Codex account "beta"/.test(entry.message)), true);
-		await commands.get("account").handler("use alpha", ctx);
+		await commands.get("accounts").handler("use alpha", ctx);
 
 		selectResponses.push("Refresh all quotas", "Auto-select an available account", "Close");
-		await commands.get("account").handler("tui", ctx);
+		await commands.get("accounts").handler("tui", ctx);
 		assert.equal(notifications.some((entry) => /Refreshing Codex account quotas/.test(entry.message)), true);
 		assert.equal(notifications.some((entry) => /Auto-selected Codex account/.test(entry.message)), true);
 
@@ -155,7 +154,7 @@ test("registers commands and drives account management through the interactive T
 		);
 		inputResponses.push("personal");
 		await commands.get("accounts").handler("manage", ctx);
-		await commands.get("account").handler("list", ctx);
+		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /personal/.test(entry.message)), true);
 
 		selectResponses.push(
@@ -163,10 +162,10 @@ test("registers commands and drives account management through the interactive T
 			"Remove account",
 			"Close",
 		);
-		await commands.get("account").handler("", ctx);
+		await commands.get("accounts").handler("", ctx);
 		assert.equal(notifications.some((entry) => /Removed Codex account "personal"/.test(entry.message)), true);
 
-		await commands.get("status").handler("", ctx);
+		await commands.get("accounts").handler("status", ctx);
 		assert.equal(
 			notifications.some(
 				(entry) =>
@@ -177,7 +176,7 @@ test("registers commands and drives account management through the interactive T
 		);
 
 		footerFailure = true;
-		await commands.get("status").handler("", ctx);
+		await commands.get("accounts").handler("status", ctx);
 		assert.equal(
 			notifications.some(
 				(entry) =>
@@ -201,7 +200,7 @@ test("registers commands and drives account management through the interactive T
 			},
 			ctx,
 		);
-		await commands.get("status").handler("", ctx);
+		await commands.get("accounts").handler("status", ctx);
 		assert.deepEqual(notifications.at(-1), {
 			message: "GPT API: requests 42 left, reset 2s | tokens 149,984 left, reset 6m0s",
 			type: "info",
