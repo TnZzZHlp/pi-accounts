@@ -23,6 +23,7 @@ import {
 	formatQuotaDetails,
 	formatQuotaFooter,
 	formatQuotaStatus,
+	formatQuotaStatusBar,
 	formatRemainingTime,
 } from "./lib/quota.js";
 
@@ -52,7 +53,7 @@ function activeAccount(view) {
 function formatFooter(view, now = Date.now()) {
 	if (view.accounts.length === 0) return "accounts: /accounts add";
 	const active = activeAccount(view);
-	const quota = formatQuotaFooter(active.quota, now);
+	const quota = formatQuotaStatusBar(active.quota, now);
 	if (quota) return `${active.alias} · ${quota}`;
 	if (active.cooldown) {
 		return `${active.alias} · ${active.cooldown.kind} ${formatRemainingTime(active.cooldown.until - now)}`;

@@ -116,16 +116,16 @@ test("registers commands and drives account management through the interactive T
 		await events.get("session_start")({}, ctx);
 		assert.equal(providers.length, 1);
 		assert.equal(providers[0].id, "openai-codex");
-		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
+		assert.equal(statuses.at(-1).text, "alpha · 1h 80% · 1d 90%");
 
 		await commands.get("accounts").handler("add beta", ctx);
 		assert.equal(widgets.some((entry) => entry.content?.includes("Device code: ABCD-EFGH")), true);
 		assert.equal(notifications.some((entry) => entry.message.includes("Device code: ABCD-EFGH")), false);
-		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
+		assert.equal(statuses.at(-1).text, "beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Added and selected Codex account "beta"/.test(entry.message)), true);
 
 		await commands.get("accounts").handler("use alpha", ctx);
-		assert.equal(statuses.at(-1).text, "alpha · 5h 80% · 7d 90% · 1h");
+		assert.equal(statuses.at(-1).text, "alpha · 1h 80% · 1d 90%");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
 
@@ -138,7 +138,7 @@ test("registers commands and drives account management through the interactive T
 			"Close",
 		);
 		await commands.get("accounts").handler("", ctx);
-		assert.equal(statuses.at(-1).text, "beta · 5h 70% · 7d 90% · 1h");
+		assert.equal(statuses.at(-1).text, "beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Selected Codex account "beta"/.test(entry.message)), true);
 		await commands.get("accounts").handler("use alpha", ctx);
 

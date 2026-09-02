@@ -7,6 +7,7 @@ import {
 	formatQuotaDetails,
 	formatQuotaFooter,
 	formatQuotaStatus,
+	formatQuotaStatusBar,
 	formatRemainingTime,
 	getQuotaResetAt,
 	isQuotaExhausted,
@@ -33,6 +34,7 @@ test("normalizes and formats five-hour and seven-day Codex quota", () => {
 		formatQuotaFooter(snapshot, NOW),
 		"5h 75% · 7d 17% · 1h",
 	);
+	assert.equal(formatQuotaStatusBar(snapshot, NOW), "1h 75% · 1d 17%");
 	assert.equal(
 		formatQuotaStatus({ ...snapshot, resetCredits: 2 }, NOW),
 		"5h 75% left, reset 1h | 7d 17% left, reset 1d | reset credits 2",
@@ -54,6 +56,24 @@ test("parses legacy Codex response headers", () => {
 		"x-codex-primary-reset-at": String(NOW / 1000 + 3600),
 	});
 	assert.equal(formatQuotaCompact(snapshot, NOW), "5h 50%");
+});
+
+test("formats status-bar windows by their reset times", () => {
+	const snapshot = parseCodexUsage({
+		rate_limit: {
+			primary_window: {
+				used_percent: 4,
+				limit_window_seconds: 5 * 60 * 60,
+				reset_at: NOW / 1000 + 4 * 60 * 60 + 3 * 60,
+			},
+			secondary_window: {
+				used_percent: 10,
+				limit_window_seconds: 7 * 24 * 60 * 60,
+				reset_after_seconds: 3 * 24 * 60 * 60 + 2 * 60 * 60,
+			},
+		},
+	});
+	assert.equal(formatQuotaStatusBar(snapshot, NOW), "4h 3m 96% · 3d 2h 90%");
 });
 
 test("labels single Codex windows by their reported duration", () => {

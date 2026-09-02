@@ -180,6 +180,26 @@ export function formatQuotaCompact(snapshot, now = Date.now()) {
 	return windows.length > 0 ? windows.join(" · ") : undefined;
 }
 
+function formatWindowForStatusBar(window, fallback, now) {
+	const remaining = quotaRemainingPercent(window);
+	if (remaining === undefined) return undefined;
+	const resetAt = getWindowResetAt(window, now);
+	const label =
+		resetAt === undefined
+			? formatWindowLength(window.windowSeconds, fallback)
+			: formatRemainingTime(resetAt - now);
+	return `${label} ${remaining}%`;
+}
+
+export function formatQuotaStatusBar(snapshot, now = Date.now()) {
+	if (!snapshot) return undefined;
+	const windows = [
+		formatWindowForStatusBar(snapshot.primary, "primary", now),
+		formatWindowForStatusBar(snapshot.secondary, "secondary", now),
+	].filter(Boolean);
+	return windows.length > 0 ? windows.join(" · ") : undefined;
+}
+
 export function formatQuotaFooter(snapshot, now = Date.now()) {
 	const quota = formatQuotaCompact(snapshot, now);
 	if (!quota) return undefined;

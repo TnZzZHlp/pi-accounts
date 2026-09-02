@@ -11,7 +11,7 @@
 - 主动读取当前账号的订阅额度，额度耗尽时按账号顺序轮换。
 - 请求收到 HTTP 429 或明确的 usage-limit 错误时，在尚未输出内容的前提下使用下一个账号无缝重试。
 - 对 SSE、WebSocket 和 WebSocket 缓存传输都传入真正选中的 access token，避免复用旧账号连接。
-- 底栏示例：`work · 5h 72% · 7d 41% · 2h`；最后一项只显示最近的 reset 时间。
+- 底栏示例：`work · 4h 3m 72% · 3d 2h 41%`；每个窗口前的时间是对应额度的 reset 倒计时。
 - `/accounts status` 显示当前 Codex 账号的完整额度、重置时间、reset credits 和本地账号标识。
 - 使用 API key 的其他 GPT 模型会从 provider 响应中读取标准 `x-ratelimit-*` 请求及 Token 限额，并通过 `/accounts status` 显示。
 - `/accounts` 不带参数会打开交互式 TUI，可直接查看、切换和管理账号。
