@@ -21,7 +21,6 @@ import { asText, maskEmail, validateAlias } from "./lib/credentials.js";
 import { BASE_PROVIDER_SYMBOL, createManagedProvider } from "./lib/managed-provider.js";
 import {
 	formatQuotaDetails,
-	formatQuotaFooter,
 	formatQuotaStatus,
 	formatQuotaStatusBar,
 	formatRemainingTime,
@@ -94,7 +93,7 @@ function formatAccountList(view) {
 function formatTuiAccount(account, now = Date.now()) {
 	const marker = account.active ? "*" : " ";
 	const identity = maskEmail(account.email);
-	const quota = formatQuotaFooter(account.quota, now);
+	const quota = account.quota ? formatQuotaDetails(account.quota, now) : undefined;
 	const availability =
 		quota ??
 		(account.cooldown
@@ -177,6 +176,7 @@ export function createPiAccountsExtension(options = {}) {
 		let pollTimer;
 		let shuttingDown = false;
 		let apiRateLimits;
+		let resetCreditInFlight = false;
 		const now = () => options.now?.() ?? Date.now();
 
 		const manager =
@@ -293,6 +293,62 @@ export function createPiAccountsExtension(options = {}) {
 			return account;
 		}
 
+		async function consumeResetCredit(ctx, alias) {
+			if (ctx.hasUI === false) throw new Error("Consuming a reset credit requires interactive or RPC UI");
+			if (resetCreditInFlight) {
+				notify(ctx, "A reset credit consumption is already in progress.", "warning");
+				return;
+			}
+			resetCreditInFlight = true;
+			try {
+				const account = await manager.refreshAccount(alias, { force: true, signal: ctx.signal });
+				if (!account) throw new Error(`Unknown account: ${alias}`);
+				const available = account.quota?.resetCredits;
+				if (available === undefined) {
+					notify(ctx, `Cannot consume a reset credit for account "${account.alias}": available count is unknown.`, "warning");
+					return;
+				}
+				if (available <= 0) {
+					notify(ctx, `Account "${account.alias}" has no reset credits available.`, "warning");
+					return;
+				}
+				const confirmed = await ctx.ui.confirm(
+					"Consume Codex reset credit",
+					`Consume one reset credit for account "${account.alias}"? This is an irreversible remote action.`,
+				);
+				if (!confirmed) {
+					notify(ctx, "Reset credit consumption cancelled.");
+					return;
+				}
+				const result = await manager.consumeResetCredit(account.alias, { signal: ctx.signal });
+				if (!result.consumed) {
+					notify(
+						ctx,
+						result.reason === "none"
+							? `Account "${account.alias}" has no reset credits available.`
+							: `Cannot consume a reset credit for account "${account.alias}": available count is unknown.`,
+						"warning",
+					);
+					return;
+				}
+				await updateFooter(ctx);
+				if (!result.refreshed) {
+					notify(
+						ctx,
+						`Consumed one reset credit for account "${account.alias}", but usage refresh failed: ${result.refreshError}`,
+						"warning",
+					);
+					return;
+				}
+				notify(
+					ctx,
+					`Consumed one reset credit for account "${account.alias}". ${formatQuotaDetails(result.snapshot, now())}`,
+				);
+			} finally {
+				resetCreditInFlight = false;
+			}
+		}
+
 		async function removeAccount(ctx, alias) {
 			if (ctx.hasUI === false) throw new Error("Removing an account requires interactive or RPC UI");
 			const confirmed = await ctx.ui.confirm(
@@ -319,6 +375,7 @@ export function createPiAccountsExtension(options = {}) {
 				const details = formatQuotaDetails(account.quota, now());
 				const choices = [
 					...(account.active ? [] : ["Use this account"]),
+					"Consume one reset credit",
 					"Rename account",
 					"Remove account",
 					"Back",
@@ -331,6 +388,10 @@ export function createPiAccountsExtension(options = {}) {
 				if (choice === "Use this account") {
 					await selectAccount(ctx, account.alias);
 					return;
+				}
+				if (choice === "Consume one reset credit") {
+					await consumeResetCredit(ctx, account.alias);
+					continue;
 				}
 				if (choice === "Rename account") {
 					const value = await ctx.ui.input("Rename Codex account", account.alias);

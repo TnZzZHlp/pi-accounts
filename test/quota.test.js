@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+	consumeCodexResetCredit,
 	fetchCodexUsage,
 	formatQuotaCompact,
 	formatQuotaDetails,
@@ -91,6 +92,112 @@ test("labels single Codex windows by their reported duration", () => {
 		"7d 96% · 5d",
 	);
 	assert.equal(formatQuotaFooter({ primary: {} }, NOW), undefined);
+});
+
+test("consumes one reset credit with the selected account authentication", async () => {
+	const credential = createCredential("account-alpha");
+	const calls = [];
+	const response = await consumeCodexResetCredit(credential, {
+		fetchImpl: async (url, init) => {
+			calls.push({ url, init });
+			return { ok: true, status: 200, json: async () => ({ code: "reset", windows_reset: 2 }) };
+		},
+	});
+	assert.equal(calls.length, 1);
+	assert.match(calls[0].url, /rate-limit-reset-credits\/consume$/);
+	assert.equal(calls[0].init.method, "POST");
+	assert.equal(calls[0].init.headers.Authorization, `Bearer ${credential.access}`);
+	assert.equal(calls[0].init.headers["chatgpt-account-id"], "account-alpha");
+	assert.equal(calls[0].init.headers["Content-Type"], "application/json");
+	const body = JSON.parse(calls[0].init.body);
+	assert.match(body.redeem_request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+	assert.equal("credit_id" in body, false);
+	assert.deepEqual(response, { code: "reset", windowsReset: 2 });
+});
+
+test("does not retry failed reset-credit requests or accept business failures", async () => {
+	const credential = createCredential("account-alpha");
+	let calls = 0;
+	await assert.rejects(
+		consumeCodexResetCredit(credential, {
+			fetchImpl: async () => {
+				calls++;
+				return { ok: false, status: 403, json: async () => ({}) };
+			},
+		}),
+		(error) =>
+			error.name === "ResetCreditRequestError" &&
+			error.status === 403 &&
+			error.outcome === "rejected",
+	);
+	assert.equal(calls, 1);
+
+	await assert.rejects(
+		consumeCodexResetCredit(credential, {
+			fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ code: "no_credit" }) }),
+		}),
+		(error) =>
+			error.name === "ResetCreditRequestError" &&
+			error.code === "no_credit" &&
+			error.outcome === "rejected",
+	);
+
+	await assert.rejects(
+		consumeCodexResetCredit(credential, {
+			fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ code: "future_status" }) }),
+		}),
+		(error) =>
+			error.name === "ResetCreditRequestError" &&
+			error.code === "future_status" &&
+			error.outcome === "unknown" &&
+			/may already have been consumed/.test(error.message),
+	);
+});
+
+test("marks network, server, and malformed reset-credit responses as unknown", async () => {
+	const credential = createCredential("account-alpha");
+	const scenarios = [
+		{
+			name: "network",
+			fetchImpl: async () => {
+				throw new Error("offline");
+			},
+		},
+		{
+			name: "server",
+			fetchImpl: async () => ({ ok: false, status: 503, json: async () => ({}) }),
+		},
+		{
+			name: "malformed JSON",
+			fetchImpl: async () => ({
+				ok: true,
+				status: 200,
+				json: async () => {
+					throw new SyntaxError("invalid JSON");
+				},
+			}),
+		},
+	];
+
+	for (const scenario of scenarios) {
+		let calls = 0;
+		await assert.rejects(
+			consumeCodexResetCredit(credential, {
+				fetchImpl: async (...args) => {
+					calls++;
+					return scenario.fetchImpl(...args);
+				},
+			}),
+			(error) => {
+				assert.equal(error.name, "ResetCreditRequestError", scenario.name);
+				assert.equal(error.outcome, "unknown", scenario.name);
+				assert.match(error.message, /may already have been consumed/);
+				assert.match(error.message, /Do not retry now/);
+				return true;
+			},
+		);
+		assert.equal(calls, 1, `${scenario.name} must issue exactly one POST`);
+	}
 });
 
 test("fetches quota with the selected account token and id", async () => {

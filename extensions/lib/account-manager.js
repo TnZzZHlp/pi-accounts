@@ -19,6 +19,7 @@ import {
 	writePiCodexCredential,
 } from "./account-store.js";
 import {
+	consumeCodexResetCredit,
 	fetchCodexUsage,
 	getQuotaResetAt,
 	isQuotaExhausted,
@@ -450,6 +451,21 @@ export class AccountManager {
 		);
 	}
 
+	async refreshAccount(alias, options = {}) {
+		return this._serialized(async () => {
+			const state = await this.store.load();
+			const account = findAccount(state, alias);
+			if (!account) throw new Error(`Unknown account: ${alias}`);
+			await this._fetchQuota(account, {
+				force: options.force !== false,
+				signal: options.signal,
+				throwOnError: true,
+			});
+			const view = this._viewFromState(await this.store.load());
+			return view.accounts.find((candidate) => aliasKey(candidate.alias) === aliasKey(alias));
+		});
+	}
+
 	async refreshAll(options = {}) {
 		return this._serialized(async () => {
 			const state = await this.store.load();
@@ -468,6 +484,54 @@ export class AccountManager {
 			}
 			this._emitChange();
 			return this._viewFromState(await this.store.load());
+		});
+	}
+
+	async consumeResetCredit(alias, options = {}) {
+		return this._serialized(async () => {
+			let state = await this.store.load();
+			let account = findAccount(state, alias);
+			if (!account) throw new Error(`Unknown account: ${alias}`);
+			const snapshot = await this._fetchQuota(account, {
+				force: true,
+				signal: options.signal,
+				throwOnError: true,
+			});
+			if (snapshot?.resetCredits === undefined) return { consumed: false, reason: "unknown" };
+			if (snapshot.resetCredits <= 0) return { consumed: false, reason: "none" };
+
+			state = await this.store.load();
+			account = findAccount(state, alias);
+			if (!account) throw new Error(`Unknown account: ${alias}`);
+			const credentialAccount = await this._refreshCredential(account, { signal: options.signal });
+			const response = await consumeCodexResetCredit(credentialAccount.credential, {
+				fetchImpl: this.fetchImpl,
+				signal: options.signal,
+			});
+			const key = aliasKey(credentialAccount.alias);
+			this.quota.delete(key);
+			if (this.cooldowns.get(key)?.kind === "quota") this.cooldowns.delete(key);
+			try {
+				const refreshedSnapshot = await this._fetchQuota(credentialAccount, {
+					force: true,
+					signal: options.signal,
+					throwOnError: true,
+				});
+				return {
+					consumed: true,
+					refreshed: true,
+					response,
+					snapshot: refreshedSnapshot,
+				};
+			} catch (error) {
+				this.quota.delete(key);
+				return {
+					consumed: true,
+					refreshed: false,
+					response,
+					refreshError: error instanceof Error ? error.message : String(error),
+				};
+			}
 		});
 	}
 

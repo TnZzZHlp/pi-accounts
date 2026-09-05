@@ -211,6 +211,115 @@ test("registers commands and drives account management through the interactive T
 	}
 });
 
+test("consumes a selected non-active account credit only after confirmation", async () => {
+	const view = {
+		active: "alpha",
+		accounts: [
+			{
+				alias: "alpha",
+				accountId: "alpha",
+				email: "alpha@example.com",
+				active: true,
+				quota: {
+					primary: { usedPercent: 20, windowSeconds: 5 * 60 * 60, resetAt: NOW + 60 * 60_000 },
+					secondary: { usedPercent: 30, windowSeconds: 7 * 24 * 60 * 60, resetAt: NOW + 24 * 60 * 60_000 },
+					resetCredits: 1,
+				},
+			},
+			{
+				alias: "beta",
+				accountId: "beta",
+				email: "beta@example.com",
+				active: false,
+				quota: {
+					primary: { usedPercent: 100, windowSeconds: 5 * 60 * 60, resetAt: NOW + 60 * 60_000 },
+					secondary: { usedPercent: 100, windowSeconds: 7 * 24 * 60 * 60, resetAt: NOW + 24 * 60 * 60_000 },
+					resetCredits: 1,
+				},
+			},
+		],
+	};
+	const consumed = [];
+	const refreshed = [];
+	const manager = {
+		async getView() {
+			return structuredClone(view);
+		},
+		async refreshAccount(alias) {
+			refreshed.push(alias);
+			return structuredClone(view.accounts.find((account) => account.alias === alias));
+		},
+		async consumeResetCredit(alias) {
+			consumed.push(alias);
+			const account = view.accounts.find((candidate) => candidate.alias === alias);
+			account.quota.resetCredits = 0;
+			account.quota.primary.usedPercent = 20;
+			account.quota.secondary.usedPercent = 30;
+			return { consumed: true, refreshed: true, snapshot: structuredClone(account.quota) };
+		},
+	};
+	const commands = new Map();
+	const pi = {
+		on() {},
+		registerCommand(name, command) {
+			commands.set(name, command);
+		},
+	};
+	const notifications = [];
+	const selectResponses = [];
+	const confirmations = [false, true];
+	const confirmCalls = [];
+	const ctx = {
+		hasUI: true,
+		isIdle: () => true,
+		ui: {
+			setStatus() {},
+			notify(message, type) {
+				notifications.push({ message, type });
+			},
+			select(title, options) {
+				const response = selectResponses.shift();
+				return Promise.resolve(typeof response === "function" ? response({ title, options }) : response);
+			},
+			confirm(title, message) {
+				confirmCalls.push({ title, message });
+				return Promise.resolve(confirmations.shift());
+			},
+		},
+	};
+
+	createPiAccountsExtension({ manager, now: () => NOW })(pi);
+	const command = commands.get("accounts");
+	selectResponses.push(
+		({ options }) => {
+			const option = options.find((value) => value.includes("beta"));
+			assert.match(option, /5h 0% \(reset 1h\).*7d 0% \(reset 1d\).*reset credits 1/);
+			return option;
+		},
+		"Consume one reset credit",
+		"Back",
+		"Close",
+	);
+	await command.handler("", ctx);
+	assert.deepEqual(refreshed, ["beta"]);
+	assert.deepEqual(consumed, []);
+	assert.equal(view.active, "alpha");
+	assert.match(confirmCalls[0].message, /one reset credit.*beta/);
+	assert.equal(notifications.some((entry) => /consumption cancelled/.test(entry.message)), true);
+
+	selectResponses.push(
+		({ options }) => options.find((option) => option.includes("beta")),
+		"Consume one reset credit",
+		"Back",
+		"Close",
+	);
+	await command.handler("", ctx);
+	assert.deepEqual(consumed, ["beta"]);
+	assert.equal(view.active, "alpha");
+	assert.equal(view.accounts.find((account) => account.alias === "beta").quota.resetCredits, 0);
+	assert.equal(notifications.some((entry) => /Consumed one reset credit for account "beta"/.test(entry.message)), true);
+});
+
 test("resolves the Pi agent directory from the supported environment variable", () => {
 	assert.equal(resolvePiAgentDir({}, "/home/tester"), "/home/tester/.pi/agent");
 	assert.equal(resolvePiAgentDir({ PI_CODING_AGENT_DIR: "~/custom" }, "/home/tester"), "/home/tester/custom");

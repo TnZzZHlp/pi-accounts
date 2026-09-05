@@ -1,4 +1,10 @@
-import { CODEX_USAGE_URL, REQUEST_TIMEOUT_MS } from "./constants.js";
+import { randomUUID } from "node:crypto";
+
+import {
+	CODEX_RESET_CREDITS_CONSUME_URL,
+	CODEX_USAGE_URL,
+	REQUEST_TIMEOUT_MS,
+} from "./constants.js";
 import {
 	asFiniteNumber,
 	asRecord,
@@ -13,6 +19,15 @@ export class QuotaRequestError extends Error {
 		super(message);
 		this.name = "QuotaRequestError";
 		this.status = status;
+	}
+}
+
+export class ResetCreditRequestError extends QuotaRequestError {
+	constructor(message, status, code, outcome = "unknown") {
+		super(message, status);
+		this.name = "ResetCreditRequestError";
+		this.code = code;
+		this.outcome = outcome;
 	}
 }
 
@@ -260,6 +275,93 @@ export async function fetchCodexUsage(credentialValue, options = {}) {
 		...snapshot,
 		email: snapshot.email ?? extractChatGptAccountEmail(credential.access),
 	};
+}
+
+function isDefiniteResetCreditRejection(status) {
+	return Number.isInteger(status) && status >= 400 && status < 500;
+}
+
+function unknownResetCreditError(reason, status, code, cause) {
+	const error = new ResetCreditRequestError(
+		`Codex reset credit result is unknown${reason ? ` (${reason})` : ""}; the credit may already have been consumed. Do not retry now; verify the result with the service provider first.`,
+		status,
+		code,
+		"unknown",
+	);
+	if (cause !== undefined) error.cause = cause;
+	return error;
+}
+
+export async function consumeCodexResetCredit(credentialValue, options = {}) {
+	const credential = normalizeOAuthCredential(credentialValue);
+	const accountId = getCredentialAccountId(credential);
+	if (!accountId) throw new Error("Could not extract the ChatGPT account id from the OAuth token");
+	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+	if (typeof fetchImpl !== "function") throw new Error("Fetch is unavailable in this runtime");
+	const redeemRequestId = randomUUID();
+	let response;
+	try {
+		response = await fetchImpl(options.url ?? CODEX_RESET_CREDITS_CONSUME_URL, {
+			method: "POST",
+			headers: {
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				Authorization: `Bearer ${credential.access}`,
+				"chatgpt-account-id": accountId,
+				originator: "pi",
+			},
+			body: JSON.stringify({ redeem_request_id: redeemRequestId }),
+			signal: combineSignals(options.signal, options.timeoutMs ?? REQUEST_TIMEOUT_MS),
+		});
+	} catch (error) {
+		throw unknownResetCreditError("the request failed", undefined, undefined, error);
+	}
+
+	if (!response?.ok) {
+		if (isDefiniteResetCreditRejection(response?.status)) {
+			throw new ResetCreditRequestError(
+				`Codex reset credit request was rejected (${response.status})`,
+				response.status,
+				undefined,
+				"rejected",
+			);
+		}
+		throw unknownResetCreditError(
+			`the provider returned HTTP ${response?.status ?? "an unknown status"}`,
+			response?.status,
+		);
+	}
+
+	let payload;
+	try {
+		payload = asRecord(await response.json());
+	} catch (error) {
+		throw unknownResetCreditError("the provider response could not be parsed", response.status, undefined, error);
+	}
+	if (!payload) {
+		throw unknownResetCreditError("the provider response was not a JSON object", response.status);
+	}
+
+	const code = asText(payload.code);
+	if (code === "reset") {
+		return {
+			code,
+			windowsReset: asFiniteNumber(payload.windows_reset ?? payload.windowsReset),
+		};
+	}
+	if (code === "no_credit") {
+		throw new ResetCreditRequestError(
+			"Codex reset credit request was rejected: no reset credit is available",
+			response.status,
+			code,
+			"rejected",
+		);
+	}
+	throw unknownResetCreditError(
+		`the provider returned unknown response code ${code ?? "unknown"}`,
+		response.status,
+		code,
+	);
 }
 
 export function parseRetryAfter(headers, now = Date.now()) {

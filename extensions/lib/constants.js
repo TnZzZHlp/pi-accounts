@@ -1,6 +1,8 @@
 export const CODEX_PROVIDER = "openai-codex";
 export const CODEX_API = "openai-codex-responses";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+export const CODEX_RESET_CREDITS_CONSUME_URL =
+	"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
 export const ACCOUNT_STORE_VERSION = 1;
 export const ACCOUNT_STORE_FILENAME = "pi-accounts.json";
