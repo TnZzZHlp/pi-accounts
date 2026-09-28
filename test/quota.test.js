@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
 	consumeCodexResetCredit,
+	fetchCodexResetCreditExpiries,
 	fetchCodexUsage,
 	formatQuotaCompact,
 	formatQuotaDetails,
@@ -38,7 +39,7 @@ test("normalizes and formats five-hour and seven-day Codex quota", () => {
 	assert.equal(formatQuotaStatusBar(snapshot, NOW), "1h 75% · 1d 17%");
 	assert.equal(
 		formatQuotaStatus({ ...snapshot, resetCredits: 2 }, NOW),
-		"5h 75% left, reset 1h | 7d 17% left, reset 1d | reset credits 2",
+		"5h 75% left, reset 1h | 7d 17% left, reset 1d | reset credits 2 (1-2: expiry unknown)",
 	);
 	assert.equal(isQuotaExhausted(snapshot), false);
 	assert.equal(formatRemainingTime((2 * 24 * 60 + 3 * 60 + 4) * 60_000), "2d 3h 4m");
@@ -213,6 +214,100 @@ test("fetches quota with the selected account token and id", async () => {
 	assert.equal(calls[0].init.headers.Authorization, `Bearer ${credential.access}`);
 	assert.equal(calls[0].init.headers["chatgpt-account-id"], "account-alpha");
 	assert.equal(formatQuotaCompact(snapshot, NOW), "5h 90% · 7d 80%");
+	assert.equal(calls.length, 1);
+});
+
+test("shows available reset-credit expiries without replacing the usage count", async () => {
+	const credential = createCredential("account-alpha");
+	const requests = [];
+	const expiresAt = "2033-05-20T12:00:00Z";
+	const fetchImpl = async (url, init) => {
+		requests.push({ url, init });
+		return {
+			ok: true,
+			status: 200,
+			json: async () =>
+				url.endsWith("/usage")
+					? { ...quotaPayload(10, 20), rate_limit_reset_credits: { available_count: 4 } }
+					: {
+						credits: [
+							{ status: "available", expires_at: expiresAt },
+							{ status: "redeemed", expires_at: "2033-05-21T12:00:00Z" },
+							{ status: "available", expires_at: null },
+							{ status: "available", expires_at: "invalid" },
+						],
+						available_count: 1,
+					},
+		};
+	};
+	const snapshot = await fetchCodexUsage(credential, { fetchImpl });
+	assert.equal(requests.length, 1);
+	assert.equal(snapshot.resetCredits, 4);
+	snapshot.resetCreditExpiries = await fetchCodexResetCreditExpiries(credential, snapshot.resetCredits, { fetchImpl });
+	assert.equal(requests.length, 2);
+	assert.match(requests[1].url, /\/rate-limit-reset-credits$/);
+	assert.equal(requests[1].init.headers.Authorization, `Bearer ${credential.access}`);
+	assert.equal(requests[1].init.headers["chatgpt-account-id"], "account-alpha");
+	assert.deepEqual(snapshot.resetCreditExpiries, [Date.parse(expiresAt), null, undefined]);
+	const localDate = new Date(expiresAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+	const credits = `reset credits 4 (1: expires ${localDate}; 2: does not expire; 3: expiry unknown; 4: expiry unknown)`;
+	assert.ok(formatQuotaDetails(snapshot, NOW).endsWith(credits));
+	assert.ok(formatQuotaStatus(snapshot, NOW).endsWith(credits));
+	assert.equal(formatQuotaStatusBar(snapshot, NOW), "1h 90% · 1d 80%");
+});
+
+test("keeps the usage count if reset-credit details fail or are incomplete", async () => {
+	const credential = createCredential("account-alpha");
+	for (const detailResponse of [
+		{ ok: false, status: 403 },
+		{ ok: true, json: async () => ({ credits: null }) },
+		undefined,
+	]) {
+		const snapshot = await fetchCodexUsage(credential, {
+			fetchImpl: async () => ({
+				ok: true,
+				json: async () => ({ rate_limit_reset_credits: { available_count: 2 } }),
+			}),
+		});
+		snapshot.resetCreditExpiries = await fetchCodexResetCreditExpiries(credential, 2, {
+			fetchImpl: async () => {
+				if (!detailResponse) throw new Error("details unavailable");
+				return detailResponse;
+			},
+		});
+		assert.equal(formatQuotaDetails(snapshot), "reset credits 2 (1-2: expiry unknown)");
+	}
+	let calls = 0;
+	const empty = await fetchCodexUsage(credential, {
+		fetchImpl: async () => {
+			calls++;
+			return { ok: true, json: async () => ({ rate_limit_reset_credits: { available_count: 0 } }) };
+		},
+	});
+	assert.equal(calls, 1);
+	assert.deepEqual(await fetchCodexResetCreditExpiries(credential, 0, { fetchImpl: async () => { calls++; } }), []);
+	assert.equal(calls, 1);
+	assert.equal(formatQuotaDetails(empty), "reset credits 0");
+});
+
+test("bounds optional reset-credit detail requests by their own timeout", async () => {
+	let aborted = false;
+	const expiries = await fetchCodexResetCreditExpiries(createCredential("account-alpha"), 1, {
+		timeoutMs: 5,
+		fetchImpl: async (_url, init) =>
+			new Promise((resolve) => {
+				init.signal.addEventListener(
+					"abort",
+					() => {
+						aborted = true;
+						resolve({ ok: false, status: 408 });
+					},
+					{ once: true },
+				);
+			}),
+	});
+	assert.equal(aborted, true);
+	assert.equal(expiries, undefined);
 });
 
 test("extracts account identity and derives unique safe aliases", () => {

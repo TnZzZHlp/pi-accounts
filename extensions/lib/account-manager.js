@@ -20,6 +20,7 @@ import {
 } from "./account-store.js";
 import {
 	consumeCodexResetCredit,
+	fetchCodexResetCreditExpiries,
 	fetchCodexUsage,
 	getQuotaResetAt,
 	isQuotaExhausted,
@@ -343,7 +344,17 @@ export class AccountManager {
 		const key = aliasKey(accountValue.alias);
 		const cached = this.quota.get(key);
 		if (!options.force && cached && this.now() - cached.checkedAt < this.quotaTtlMs) {
-			return cached.snapshot;
+			const snapshot = cached.snapshot;
+			if (
+				!options.includeResetCreditDetails ||
+				!snapshot ||
+				snapshot.resetCreditDetailsChecked
+			) {
+				return snapshot;
+			}
+			const refreshed = await this._fetchResetCreditDetails(accountValue, snapshot, options);
+			this.quota.set(key, { ...cached, snapshot: refreshed });
+			return refreshed;
 		}
 		let account;
 		try {
@@ -365,6 +376,9 @@ export class AccountManager {
 					throw error;
 				}
 			}
+			if (options.includeResetCreditDetails) {
+				snapshot = await this._fetchResetCreditDetails(account, snapshot, options);
+			}
 			this.quota.set(key, { snapshot, checkedAt: this.now(), error: undefined });
 			await this._updateAccountEmail(account.alias, snapshot.email);
 			if (isQuotaExhausted(snapshot)) {
@@ -379,6 +393,7 @@ export class AccountManager {
 			this._emitChange();
 			return snapshot;
 		} catch (error) {
+			if (options.signal?.aborted) throw error;
 			this.quota.set(key, {
 				snapshot: cached?.snapshot,
 				checkedAt: this.now(),
@@ -388,6 +403,15 @@ export class AccountManager {
 			if (options.throwOnError) throw error;
 			return cached?.snapshot;
 		}
+	}
+
+	async _fetchResetCreditDetails(account, snapshot, options = {}) {
+		const resetCreditExpiries = await fetchCodexResetCreditExpiries(
+			account.credential,
+			snapshot.resetCredits,
+			{ fetchImpl: this.fetchImpl, signal: options.signal },
+		);
+		return { ...snapshot, resetCreditExpiries, resetCreditDetailsChecked: true };
 	}
 
 	_orderAccounts(state) {
@@ -459,7 +483,8 @@ export class AccountManager {
 			await this._fetchQuota(account, {
 				force: options.force !== false,
 				signal: options.signal,
-				throwOnError: true,
+				includeResetCreditDetails: options.includeResetCreditDetails,
+				throwOnError: options.throwOnError !== false,
 			});
 			const view = this._viewFromState(await this.store.load());
 			return view.accounts.find((candidate) => aliasKey(candidate.alias) === aliasKey(alias));
@@ -473,6 +498,7 @@ export class AccountManager {
 				await this._fetchQuota(account, {
 					force: options.force !== false,
 					signal: options.signal,
+					includeResetCreditDetails: options.includeResetCreditDetails,
 				});
 			}
 			if (state.accounts.length > 0) {
@@ -515,6 +541,7 @@ export class AccountManager {
 				const refreshedSnapshot = await this._fetchQuota(credentialAccount, {
 					force: true,
 					signal: options.signal,
+					includeResetCreditDetails: true,
 					throwOnError: true,
 				});
 				return {

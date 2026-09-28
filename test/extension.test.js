@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import { AccountManager } from "../extensions/lib/account-manager.js";
+import { AccountStore } from "../extensions/lib/account-store.js";
 import { createPiAccountsExtension, resolvePiAgentDir } from "../extensions/pi-accounts.js";
 import { createCredential, NOW, quotaPayload } from "./helpers.js";
 
@@ -211,6 +213,53 @@ test("registers commands and drives account management through the interactive T
 	}
 });
 
+test("lists accounts after a failed quota check while its empty snapshot is cached", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-accounts-list-failure-"));
+	let quotaCalls = 0;
+	const manager = new AccountManager({
+		store: new AccountStore(join(agentDir, "pi-accounts.json")),
+		authPath: join(agentDir, "auth.json"),
+		now: () => NOW,
+		quotaTtlMs: 60_000,
+		fetchImpl: async () => {
+			quotaCalls++;
+			return { ok: false, status: 503 };
+		},
+	});
+	manager.setProvider({
+		auth: { oauth: { async refresh(credential) { return credential; } } },
+	});
+	const commands = new Map();
+	const pi = {
+		on() {},
+		registerCommand(name, command) {
+			commands.set(name, command);
+		},
+	};
+	const notifications = [];
+	const ctx = {
+		hasUI: true,
+		ui: {
+			setStatus() {},
+			notify(message, type) {
+				notifications.push({ message, type });
+			},
+		},
+	};
+	try {
+		await manager.addCredential(createCredential("alpha"), "alpha");
+		createPiAccountsExtension({ manager, now: () => NOW })(pi);
+		const command = commands.get("accounts");
+		await command.handler("list", ctx);
+		await command.handler("list", ctx);
+		assert.equal(quotaCalls, 1);
+		assert.equal(notifications.length, 2);
+		assert.match(notifications.at(-1).message, /alpha.*quota unavailable; quota check: Codex quota request failed \(503\)/);
+	} finally {
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("consumes a selected non-active account credit only after confirmation", async () => {
 	const view = {
 		active: "alpha",
@@ -224,6 +273,7 @@ test("consumes a selected non-active account credit only after confirmation", as
 					primary: { usedPercent: 20, windowSeconds: 5 * 60 * 60, resetAt: NOW + 60 * 60_000 },
 					secondary: { usedPercent: 30, windowSeconds: 7 * 24 * 60 * 60, resetAt: NOW + 24 * 60 * 60_000 },
 					resetCredits: 1,
+					resetCreditExpiries: [null],
 				},
 			},
 			{
@@ -235,24 +285,29 @@ test("consumes a selected non-active account credit only after confirmation", as
 					primary: { usedPercent: 100, windowSeconds: 5 * 60 * 60, resetAt: NOW + 60 * 60_000 },
 					secondary: { usedPercent: 100, windowSeconds: 7 * 24 * 60 * 60, resetAt: NOW + 24 * 60 * 60_000 },
 					resetCredits: 1,
+					resetCreditExpiries: [Date.parse("2033-05-20T12:00:00Z")],
 				},
 			},
 		],
 	};
 	const consumed = [];
 	const refreshed = [];
+	const hydrated = [];
 	const manager = {
 		async getView() {
 			return structuredClone(view);
 		},
-		async refreshAccount(alias) {
+		async refreshAll() {},
+		async refreshAccount(alias, options = {}) {
 			refreshed.push(alias);
+			hydrated.push(options.includeResetCreditDetails);
 			return structuredClone(view.accounts.find((account) => account.alias === alias));
 		},
 		async consumeResetCredit(alias) {
 			consumed.push(alias);
 			const account = view.accounts.find((candidate) => candidate.alias === alias);
-			account.quota.resetCredits = 0;
+			account.quota.resetCredits = 1;
+			account.quota.resetCreditExpiries = [Date.parse("2033-06-20T12:00:00Z")];
 			account.quota.primary.usedPercent = 20;
 			account.quota.secondary.usedPercent = 30;
 			return { consumed: true, refreshed: true, snapshot: structuredClone(account.quota) };
@@ -271,6 +326,7 @@ test("consumes a selected non-active account credit only after confirmation", as
 	const confirmCalls = [];
 	const ctx = {
 		hasUI: true,
+		model: { provider: "openai-codex", id: "gpt-test", api: "openai-codex-responses" },
 		isIdle: () => true,
 		ui: {
 			setStatus() {},
@@ -290,10 +346,14 @@ test("consumes a selected non-active account credit only after confirmation", as
 
 	createPiAccountsExtension({ manager, now: () => NOW })(pi);
 	const command = commands.get("accounts");
+	await command.handler("status", ctx);
+	assert.match(notifications.at(-1).message, /reset credits 1 \(1: does not expire\)/);
+	await command.handler("list", ctx);
+	assert.match(notifications.at(-1).message, /beta.*reset credits 1 \(1: expires /);
 	selectResponses.push(
 		({ options }) => {
 			const option = options.find((value) => value.includes("beta"));
-			assert.match(option, /5h 0% \(reset 1h\).*7d 0% \(reset 1d\).*reset credits 1/);
+			assert.match(option, /5h 0% \(reset 1h\).*7d 0% \(reset 1d\).*reset credits 1 \(1: expires /);
 			return option;
 		},
 		"Consume one reset credit",
@@ -301,7 +361,8 @@ test("consumes a selected non-active account credit only after confirmation", as
 		"Close",
 	);
 	await command.handler("", ctx);
-	assert.deepEqual(refreshed, ["beta"]);
+	assert.deepEqual(refreshed, ["alpha", "beta", "beta"]);
+	assert.ok(hydrated.every(Boolean));
 	assert.deepEqual(consumed, []);
 	assert.equal(view.active, "alpha");
 	assert.match(confirmCalls[0].message, /one reset credit.*beta/);
@@ -316,8 +377,9 @@ test("consumes a selected non-active account credit only after confirmation", as
 	await command.handler("", ctx);
 	assert.deepEqual(consumed, ["beta"]);
 	assert.equal(view.active, "alpha");
-	assert.equal(view.accounts.find((account) => account.alias === "beta").quota.resetCredits, 0);
+	assert.equal(view.accounts.find((account) => account.alias === "beta").quota.resetCredits, 1);
 	assert.equal(notifications.some((entry) => /Consumed one reset credit for account "beta"/.test(entry.message)), true);
+	assert.equal(notifications.some((entry) => /reset credits 1 \(1: expires /.test(entry.message)), true);
 });
 
 test("resolves the Pi agent directory from the supported environment variable", () => {

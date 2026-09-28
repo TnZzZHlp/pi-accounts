@@ -212,7 +212,11 @@ export function createPiAccountsExtension(options = {}) {
 				return;
 			}
 			if (isCodexModel(ctx.model)) {
-				await manager.refreshAll({ force: true, signal: ctx.signal });
+				await manager.refreshAll({
+					force: true,
+					signal: ctx.signal,
+					includeResetCreditDetails: true,
+				});
 				const view = await manager.getView();
 				const footerError = await updateFooter(ctx);
 				const details = formatCodexStatus(view, now());
@@ -247,7 +251,20 @@ export function createPiAccountsExtension(options = {}) {
 		}
 
 		async function showAccounts(ctx, force = false) {
-			if (force) await manager.refreshAll({ force: true });
+			if (force) {
+				await manager.refreshAll({ force: true, includeResetCreditDetails: true });
+			} else {
+				const view = await manager.getView();
+				await Promise.all(
+					view.accounts.map((account) =>
+						manager.refreshAccount(account.alias, {
+							force: false,
+							includeResetCreditDetails: true,
+							throwOnError: false,
+						}),
+					),
+				);
+			}
 			const view = await manager.getView();
 			await updateFooter(ctx);
 			notify(ctx, formatAccountList(view), view.accounts.some((account) => account.quotaError) ? "warning" : "info");
@@ -301,7 +318,11 @@ export function createPiAccountsExtension(options = {}) {
 			}
 			resetCreditInFlight = true;
 			try {
-				const account = await manager.refreshAccount(alias, { force: true, signal: ctx.signal });
+				const account = await manager.refreshAccount(alias, {
+					force: true,
+					signal: ctx.signal,
+					includeResetCreditDetails: true,
+				});
 				if (!account) throw new Error(`Unknown account: ${alias}`);
 				const available = account.quota?.resetCredits;
 				if (available === undefined) {
@@ -415,8 +436,21 @@ export function createPiAccountsExtension(options = {}) {
 			const importLabel = "Import Pi's current Codex login";
 			const closeLabel = "Close";
 			const initialView = await manager.getView();
-			if (initialView.accounts.some((account) => !account.quota)) {
-				await manager.refreshAll({ force: false });
+			const accountsToRefresh = initialView.accounts.filter(
+				(account) =>
+					!account.quota ||
+					(account.quota.resetCredits > 0 && account.quota.resetCreditExpiries === undefined),
+			);
+			if (accountsToRefresh.length > 0) {
+				await Promise.all(
+					accountsToRefresh.map((account) =>
+						manager.refreshAccount(account.alias, {
+							force: false,
+							includeResetCreditDetails: true,
+							throwOnError: false,
+						}),
+					),
+				);
 				await updateFooter(ctx);
 			}
 			while (true) {
@@ -444,12 +478,22 @@ export function createPiAccountsExtension(options = {}) {
 					}
 					if (choice === refreshLabel) {
 						notify(ctx, "Refreshing Codex account quotas…");
-						await manager.refreshAll({ force: true });
+						await manager.refreshAll({ force: true, includeResetCreditDetails: true });
 						await updateFooter(ctx);
 						continue;
 					}
 					if (choice === autoLabel) {
 						const account = await manager.chooseAuto();
+						const refreshedView = await manager.getView();
+						await Promise.all(
+							refreshedView.accounts.map((candidate) =>
+								manager.refreshAccount(candidate.alias, {
+									force: false,
+									includeResetCreditDetails: true,
+									throwOnError: false,
+								}),
+							),
+						);
 						await refreshModelRegistry(ctx);
 						await updateFooter(ctx);
 						notify(ctx, `Auto-selected Codex account "${account.alias}".`);

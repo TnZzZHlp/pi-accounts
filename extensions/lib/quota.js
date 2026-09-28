@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import {
 	CODEX_RESET_CREDITS_CONSUME_URL,
+	CODEX_RESET_CREDITS_URL,
 	CODEX_USAGE_URL,
 	REQUEST_TIMEOUT_MS,
+	RESET_CREDIT_DETAILS_TIMEOUT_MS,
 } from "./constants.js";
 import {
 	asFiniteNumber,
@@ -225,13 +227,34 @@ export function formatQuotaFooter(snapshot, now = Date.now()) {
 	return resetAt ? `${quota} · ${formatResetTimeCompact(resetAt - now)}` : quota;
 }
 
+function formatResetCredits(snapshot) {
+	const count = snapshot.resetCredits;
+	if (count === undefined) return undefined;
+	if (count === 0) return "reset credits 0";
+	const expiries = snapshot.resetCreditExpiries ?? [];
+	const items = expiries.map((expiry, index) => {
+		let label = "expiry unknown";
+		if (expiry === null) label = "does not expire";
+		else if (Number.isFinite(expiry)) {
+			label = `expires ${new Date(expiry).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}`;
+		}
+		return `${index + 1}: ${label}`;
+	});
+	if (expiries.length < count) {
+		const first = expiries.length + 1;
+		items.push(`${first}${first < count ? `-${count}` : ""}: expiry unknown`);
+	}
+	return `reset credits ${count} (${items.join("; ")})`;
+}
+
 export function formatQuotaStatus(snapshot, now = Date.now()) {
 	if (!snapshot) return undefined;
 	const parts = [
 		formatWindowVerbose(snapshot.primary, "primary", now),
 		formatWindowVerbose(snapshot.secondary, "secondary", now),
 	].filter(Boolean);
-	if (snapshot.resetCredits !== undefined) parts.push(`reset credits ${snapshot.resetCredits}`);
+	const credits = formatResetCredits(snapshot);
+	if (credits) parts.push(credits);
 	return parts.length > 0 ? parts.join(" | ") : undefined;
 }
 
@@ -241,7 +264,8 @@ export function formatQuotaDetails(snapshot, now = Date.now()) {
 		formatWindow(snapshot.primary, "primary", now, true),
 		formatWindow(snapshot.secondary, "secondary", now, true),
 	].filter(Boolean);
-	if (snapshot.resetCredits !== undefined) windows.push(`reset credits ${snapshot.resetCredits}`);
+	const credits = formatResetCredits(snapshot);
+	if (credits) windows.push(credits);
 	return windows.length > 0 ? windows.join(" | ") : "quota unavailable";
 }
 
@@ -251,21 +275,57 @@ function combineSignals(signal, timeoutMs) {
 	return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 }
 
+export async function fetchCodexResetCreditExpiries(credentialValue, count, options = {}) {
+	if (count === 0) return [];
+	if (!Number.isInteger(count) || count < 0) return undefined;
+	try {
+		const credential = normalizeOAuthCredential(credentialValue);
+		const accountId = getCredentialAccountId(credential);
+		if (!accountId) return undefined;
+		const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+		if (typeof fetchImpl !== "function") return undefined;
+		const response = await fetchImpl(options.url ?? CODEX_RESET_CREDITS_URL, {
+			headers: {
+				Accept: "application/json",
+				Authorization: `Bearer ${credential.access}`,
+				"chatgpt-account-id": accountId,
+				originator: "pi",
+			},
+			signal: combineSignals(options.signal, options.timeoutMs ?? RESET_CREDIT_DETAILS_TIMEOUT_MS),
+		});
+		options.signal?.throwIfAborted();
+		if (!response.ok) return undefined;
+		const details = asRecord(await response.json());
+		options.signal?.throwIfAborted();
+		if (!Array.isArray(details?.credits)) return undefined;
+		return details.credits
+			.filter((credit) => asRecord(credit)?.status === "available")
+			.slice(0, count)
+			.map((credit) => {
+				if (credit.expires_at === null) return null;
+				const timestamp = typeof credit.expires_at === "string" ? Date.parse(credit.expires_at) : NaN;
+				return Number.isFinite(timestamp) ? timestamp : undefined;
+			});
+	} catch {
+		options.signal?.throwIfAborted();
+		return undefined;
+	}
+}
+
 export async function fetchCodexUsage(credentialValue, options = {}) {
 	const credential = normalizeOAuthCredential(credentialValue);
 	const accountId = getCredentialAccountId(credential);
 	if (!accountId) throw new Error("Could not extract the ChatGPT account id from the OAuth token");
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (typeof fetchImpl !== "function") throw new Error("Fetch is unavailable in this runtime");
-	const response = await fetchImpl(options.url ?? CODEX_USAGE_URL, {
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${credential.access}`,
-			"chatgpt-account-id": accountId,
-			originator: "pi",
-		},
-		signal: combineSignals(options.signal, options.timeoutMs ?? REQUEST_TIMEOUT_MS),
-	});
+	const headers = {
+		Accept: "application/json",
+		Authorization: `Bearer ${credential.access}`,
+		"chatgpt-account-id": accountId,
+		originator: "pi",
+	};
+	const signal = combineSignals(options.signal, options.timeoutMs ?? REQUEST_TIMEOUT_MS);
+	const response = await fetchImpl(options.url ?? CODEX_USAGE_URL, { headers, signal });
 	if (!response.ok) {
 		throw new QuotaRequestError(`Codex quota request failed (${response.status})`, response.status);
 	}

@@ -1,6 +1,7 @@
 export const CODEX_PROVIDER = "openai-codex";
 export const CODEX_API = "openai-codex-responses";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+export const CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 export const CODEX_RESET_CREDITS_CONSUME_URL =
 	"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
@@ -13,6 +14,7 @@ export const LOGIN_WIDGET_KEY = "pi-accounts-login";
 export const QUOTA_TTL_MS = 45_000;
 export const QUOTA_POLL_INTERVAL_MS = 60_000;
 export const REQUEST_TIMEOUT_MS = 15_000;
+export const RESET_CREDIT_DETAILS_TIMEOUT_MS = 2_000;
 export const TOKEN_REFRESH_SKEW_MS = 5 * 60_000;
 export const DEFAULT_LIMIT_COOLDOWN_MS = 5 * 60_000;
 export const DEFAULT_UNAVAILABLE_COOLDOWN_MS = 60_000;

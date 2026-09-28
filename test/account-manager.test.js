@@ -70,6 +70,128 @@ test("imports Pi's current Codex login without exposing or changing other provid
 	);
 });
 
+test("retains available reset-credit expiry details in account views", async () => {
+	const urls = [];
+	await withManager(
+		async ({ manager }) => {
+			manager.quotaTtlMs = 60_000;
+			await manager.addCredential(createCredential("alpha"), "alpha");
+			await manager.refreshAccount("alpha");
+			const account = await manager.refreshAccount("alpha", { force: false, includeResetCreditDetails: true });
+			assert.equal(account.quota.resetCredits, 2);
+			assert.deepEqual(account.quota.resetCreditExpiries, [Date.parse("2033-05-20T12:00:00Z")]);
+			assert.equal((await manager.getView()).accounts[0].quota.resetCredits, 2);
+			assert.deepEqual(
+				urls.map((url) => (url.endsWith("/usage") ? "usage" : "details")),
+				["usage", "details"],
+			);
+		},
+		{
+			fetchImpl: async (url) => {
+				urls.push(url);
+				return {
+					ok: true,
+					status: 200,
+					json: async () =>
+						url.endsWith("/usage")
+							? { ...quotaPayload(10), rate_limit_reset_credits: { available_count: 2 } }
+							: { credits: [{ status: "available", expires_at: "2033-05-20T12:00:00Z" }] },
+				};
+			},
+		},
+	);
+});
+
+test("does not retry unavailable reset-credit details during the quota cache TTL", async () => {
+	const calls = [];
+	await withManager(
+		async ({ manager }) => {
+			manager.quotaTtlMs = 60_000;
+			await manager.addCredential(createCredential("alpha"), "alpha");
+			const first = await manager.refreshAccount("alpha", {
+				force: false,
+				includeResetCreditDetails: true,
+				throwOnError: false,
+			});
+			const second = await manager.refreshAccount("alpha", {
+				force: false,
+				includeResetCreditDetails: true,
+				throwOnError: false,
+			});
+			assert.equal(first.quota.resetCredits, 2);
+			assert.equal(first.quota.resetCreditDetailsChecked, true);
+			assert.equal(second.quota.resetCredits, 2);
+			assert.equal(second.quota.resetCreditExpiries, undefined);
+			assert.deepEqual(calls, ["usage", "details"]);
+		},
+		{
+			fetchImpl: async (url) => {
+				calls.push(url.endsWith("/usage") ? "usage" : "details");
+				return url.endsWith("/usage")
+					? {
+							ok: true,
+						json: async () => ({ ...quotaPayload(10), rate_limit_reset_credits: { available_count: 2 } }),
+						}
+					: { ok: false, status: 503 };
+			},
+		},
+	);
+});
+
+test("ordinary quota checks skip optional reset-credit detail requests", async () => {
+	const urls = [];
+	await withManager(
+		async ({ manager }) => {
+			manager.quotaTtlMs = 60_000;
+			await manager.addCredential(createCredential("alpha"), "alpha");
+			await manager.ensureReady();
+			await manager.refreshAccount("alpha", { force: true });
+			assert.equal((await manager.chooseAuto()).alias, "alpha");
+			assert.equal(urls.length, 3);
+			assert.ok(urls.every((url) => url.endsWith("/usage")));
+		},
+		{
+			fetchImpl: async (url) => {
+				urls.push(url);
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ ...quotaPayload(10), rate_limit_reset_credits: { available_count: 2 } }),
+				};
+			},
+		},
+	);
+});
+
+test("caller cancellation during optional reset-credit details propagates", async () => {
+	const controller = new AbortController();
+	await withManager(
+		async ({ manager }) => {
+			await manager.addCredential(createCredential("alpha"), "alpha");
+			await assert.rejects(
+				manager.refreshAccount("alpha", {
+					includeResetCreditDetails: true,
+					signal: controller.signal,
+				}),
+				/caller cancelled/,
+			);
+		},
+		{
+			fetchImpl: async (url) => {
+				if (url.endsWith("/usage")) {
+					return {
+						ok: true,
+						status: 200,
+						json: async () => ({ ...quotaPayload(10), rate_limit_reset_credits: { available_count: 1 } }),
+					};
+				}
+				controller.abort(new Error("caller cancelled"));
+				throw new Error("fetch aborted");
+			},
+		},
+	);
+});
+
 test("automatically rotates from an exhausted active account and syncs auth.json", async () => {
 	const alpha = createCredential("alpha");
 	const beta = createCredential("beta");
@@ -115,26 +237,39 @@ test("consumes a reset credit for a non-active account and refreshes its cooldow
 			const result = await manager.consumeResetCredit("beta");
 			assert.equal(result.consumed, true);
 			assert.equal(result.refreshed, true);
-			assert.deepEqual(requests.map((request) => request.init.method ?? "GET"), ["GET", "POST", "GET"]);
+			assert.deepEqual(
+				requests.map((request) =>
+					request.url.endsWith("/usage") ? "usage" : request.url.endsWith("/consume") ? "consume" : "details",
+				),
+				["usage", "consume", "usage", "details"],
+			);
 			assert.equal(requests[1].init.headers["chatgpt-account-id"], "beta");
 			assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
 
 			const view = await manager.getView();
 			assert.equal(view.active, "alpha");
 			const beta = view.accounts.find((account) => account.alias === "beta");
-			assert.equal(beta.quota.resetCredits, 0);
+			assert.equal(beta.quota.resetCredits, 1);
+			assert.deepEqual(beta.quota.resetCreditExpiries, [Date.parse("2033-05-20T12:00:00Z")]);
 			assert.equal(beta.quota.primary.usedPercent, 20);
 			assert.equal(beta.cooldown, undefined);
 		},
 		{
-			fetchImpl: async (_url, init) => {
-				requests.push({ init });
+			fetchImpl: async (url, init) => {
+				requests.push({ url, init });
 				if (init.method === "POST") {
 					return { ok: true, status: 200, json: async () => ({ code: "reset", windows_reset: 2 }) };
 				}
+				if (url.endsWith("/rate-limit-reset-credits")) {
+					return {
+						ok: true,
+						status: 200,
+						json: async () => ({ credits: [{ status: "available", expires_at: "2033-05-20T12:00:00Z" }] }),
+					};
+				}
 				usageCalls++;
 				const payload = quotaPayload(usageCalls === 1 ? 100 : 20, 20);
-				payload.rate_limit_reset_credits = { available_count: usageCalls === 1 ? 1 : 0 };
+				payload.rate_limit_reset_credits = { available_count: usageCalls === 1 ? 2 : 1 };
 				return { ok: true, status: 200, json: async () => payload };
 			},
 		},
@@ -182,10 +317,13 @@ test("invalidates exhausted quota after reset success when usage refresh fails",
 			});
 		},
 		{
-			fetchImpl: async (_url, init) => {
-				requests.push({ init });
+			fetchImpl: async (url, init) => {
+				requests.push({ url, init });
 				if (init.method === "POST") {
 					return { ok: true, status: 200, json: async () => ({ code: "reset" }) };
+				}
+				if (url.endsWith("/rate-limit-reset-credits")) {
+					return { ok: true, status: 200, json: async () => ({ credits: [] }) };
 				}
 				usageCalls++;
 				if (usageCalls === 2) {
