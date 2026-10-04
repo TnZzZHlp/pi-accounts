@@ -177,6 +177,7 @@ export function createPiAccountsExtension(options = {}) {
 		let shuttingDown = false;
 		let apiRateLimits;
 		let resetCreditInFlight = false;
+		let sessionController;
 		const now = () => options.now?.() ?? Date.now();
 
 		const manager =
@@ -626,6 +627,8 @@ export function createPiAccountsExtension(options = {}) {
 		pi.registerCommand("accounts", commandOptions);
 
 		pi.on("session_start", async (_event, ctx) => {
+			sessionController?.abort();
+			sessionController = new AbortController();
 			shuttingDown = false;
 			currentContext = ctx;
 			apiRateLimits = undefined;
@@ -638,7 +641,15 @@ export function createPiAccountsExtension(options = {}) {
 			try {
 				manager.setProvider(baseProvider);
 				await manager.initialize({ checkQuota: true });
-				pi.registerProvider(createManagedProvider(baseProvider, manager));
+				pi.registerProvider(createManagedProvider(baseProvider, manager, {
+					signal: sessionController.signal,
+					onWait: (plan) => {
+						if (!currentContext || currentContext.hasUI === false || shuttingDown) return;
+						currentContext.ui.setStatus("pi-accounts-wait", plan
+							? `Codex waiting: ${plan.alias} · ${formatRemainingTime(plan.until - now())} · ${plan.knownReset ? "expected reset" : "next quota check"} ${new Date(plan.until).toLocaleString()} · Esc to cancel`
+							: undefined);
+					},
+				}));
 				await refreshModelRegistry(ctx);
 				await updateFooter(ctx);
 				if (pollTimer) clearInterval(pollTimer);
@@ -685,10 +696,12 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("session_shutdown", (_event, ctx) => {
 			shuttingDown = true;
+			sessionController?.abort();
 			apiRateLimits = undefined;
 			if (pollTimer) clearInterval(pollTimer);
 			pollTimer = undefined;
 			if (ctx.hasUI !== false) {
+				ctx.ui.setStatus("pi-accounts-wait", undefined);
 				ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 			}

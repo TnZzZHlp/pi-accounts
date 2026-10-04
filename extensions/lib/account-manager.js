@@ -315,7 +315,9 @@ export class AccountManager {
 			if (outcome.state.active && aliasKey(outcome.state.active) === aliasKey(account.alias)) {
 				await writePiCodexCredential(this.authPath, account.credential);
 			}
-			this.cooldowns.delete(aliasKey(account.alias));
+			if (this.cooldowns.get(aliasKey(account.alias))?.kind === "unavailable") {
+				this.cooldowns.delete(aliasKey(account.alias));
+			}
 			this._emitChange();
 			return cloneAccount(account);
 		} catch (error) {
@@ -379,15 +381,28 @@ export class AccountManager {
 			if (options.includeResetCreditDetails) {
 				snapshot = await this._fetchResetCreditDetails(account, snapshot, options);
 			}
-			this.quota.set(key, { snapshot, checkedAt: this.now(), error: undefined });
+			const checkedAt = this.now();
+			for (const window of [snapshot.primary, snapshot.secondary]) {
+				if (window && window.resetAt === undefined && Number.isFinite(window.resetAfterSeconds)) {
+					window.resetAt = checkedAt + window.resetAfterSeconds * 1000;
+				}
+			}
+			this.quota.set(key, { snapshot, checkedAt, error: undefined });
 			await this._updateAccountEmail(account.alias, snapshot.email);
-			if (isQuotaExhausted(snapshot)) {
+			const cooldown = this._isCoolingDown(account.alias);
+			if (isQuotaExhausted(snapshot) && cooldown?.kind !== "unavailable") {
+				const resetAt = getQuotaResetAt(snapshot, this.now());
 				this.cooldowns.set(key, {
 					kind: "quota",
-					until: getQuotaResetAt(snapshot, this.now()) ?? this.now() + DEFAULT_LIMIT_COOLDOWN_MS,
+					until: Math.max(
+						resetAt ?? this.now() + DEFAULT_LIMIT_COOLDOWN_MS,
+						cooldown?.source === "provider" ? cooldown.until : 0,
+					),
+					source: cooldown?.source,
+					knownReset: resetAt !== undefined || cooldown?.knownReset === true,
 					reason: "subscription quota exhausted",
 				});
-			} else if (this.cooldowns.get(key)?.kind === "quota") {
+			} else if (cooldown?.kind === "quota" && cooldown.source !== "provider") {
 				this.cooldowns.delete(key);
 			}
 			this._emitChange();
@@ -427,6 +442,7 @@ export class AccountManager {
 		const excluded = new Set([...(options.excludeAliases ?? [])].map(aliasKey));
 		const order = this._orderAccounts(state);
 		for (const original of order) {
+			options.signal?.throwIfAborted();
 			if (excluded.has(aliasKey(original.alias)) || this._isCoolingDown(original.alias)) continue;
 			let account;
 			try {
@@ -436,7 +452,7 @@ export class AccountManager {
 			}
 			if (options.checkQuota !== false) {
 				const snapshot = await this._fetchQuota(account, { signal: options.signal });
-				if (isQuotaExhausted(snapshot)) continue;
+				if (isQuotaExhausted(snapshot) && !this.quota.get(aliasKey(account.alias))?.error) continue;
 			}
 			return cloneAccount(await this._activate(account.alias));
 		}
@@ -452,6 +468,7 @@ export class AccountManager {
 				}
 			}
 		}
+		options.signal?.throwIfAborted();
 		throw new NoManagedAccountsError("Every managed Codex account is exhausted or unavailable");
 	}
 
@@ -463,6 +480,46 @@ export class AccountManager {
 				allowExhausted: options.allowExhausted !== false,
 			}),
 		);
+	}
+
+	async getQuotaWaitPlan(options = {}) {
+		return this._serialized(async () => {
+			options.signal?.throwIfAborted();
+			const state = await this.store.load();
+			if (options.refresh) {
+				for (const account of state.accounts) {
+					options.signal?.throwIfAborted();
+					await this._fetchQuota(account, { force: true, signal: options.signal });
+				}
+			}
+			const now = this.now();
+			let earliest;
+			for (const account of this._orderAccounts(state)) {
+				const key = aliasKey(account.alias);
+				const cooldown = this._isCoolingDown(account.alias);
+				if (cooldown?.kind === "unavailable") continue;
+				const cached = this.quota.get(key);
+				if (cached?.error && !cooldown) return undefined;
+				const exhausted = isQuotaExhausted(cached?.snapshot);
+				if (!exhausted && cooldown?.kind !== "quota") return undefined;
+				const resetAt = exhausted
+					? getQuotaResetAt(cached.snapshot, now, cached.checkedAt)
+					: undefined;
+				const until = Math.max(
+					resetAt ?? (cooldown?.until ?? now + DEFAULT_LIMIT_COOLDOWN_MS),
+					cooldown?.until ?? 0,
+				);
+				if (!earliest || until < earliest.until) {
+					earliest = {
+						alias: account.alias,
+						until,
+						knownReset: resetAt !== undefined || cooldown?.knownReset === true,
+					};
+				}
+			}
+			options.signal?.throwIfAborted();
+			return earliest;
+		});
 	}
 
 	async ensureReady(options = {}) {
@@ -571,16 +628,26 @@ export class AccountManager {
 		return this._serialized(async () => {
 			const key = aliasKey(alias);
 			const now = this.now();
+			const cached = this.quota.get(key);
 			const headerSnapshot = parseCodexRateLimitHeaders(details.headers);
-			if (headerSnapshot) this.quota.set(key, { snapshot: headerSnapshot, checkedAt: now });
-			const snapshot = headerSnapshot ?? this.quota.get(key)?.snapshot;
-			const until =
-				parseRetryAfter(details.headers, now) ??
-				getQuotaResetAt(snapshot, now) ??
-				now + DEFAULT_LIMIT_COOLDOWN_MS;
+			const snapshot = {
+				...cached?.snapshot,
+				primary: headerSnapshot?.primary ?? cached?.snapshot?.primary,
+				secondary: headerSnapshot?.secondary ?? cached?.snapshot?.secondary,
+				allowed: false,
+				limitReached: true,
+			};
+			this.quota.set(key, { snapshot, checkedAt: cached?.checkedAt ?? now });
+			const resetAt = getQuotaResetAt(snapshot, now, cached?.checkedAt ?? now);
+			const retryAt = parseRetryAfter(details.headers, now);
+			const until = resetAt !== undefined || retryAt !== undefined
+				? Math.max(resetAt ?? 0, retryAt ?? 0)
+				: now + DEFAULT_LIMIT_COOLDOWN_MS;
 			this.cooldowns.set(key, {
 				kind: "quota",
 				until,
+				source: "provider",
+				knownReset: resetAt !== undefined || retryAt !== undefined,
 				reason: asText(details.reason) ?? "provider rate limit",
 			});
 			this._emitChange();

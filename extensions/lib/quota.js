@@ -74,6 +74,8 @@ export function parseCodexUsage(payload) {
 	const snapshot = {
 		email: asText(data.email ?? data.account_email ?? data.accountEmail),
 		planType: asText(data.plan_type ?? data.planType),
+		allowed: typeof rateLimit?.allowed === "boolean" ? rateLimit.allowed : undefined,
+		limitReached: rateLimit?.limit_reached === true || rateLimit?.limitReached === true,
 		primary: parseWindow(
 			rateLimit?.primary_window ?? rateLimit?.primaryWindow ?? rateLimit?.primary,
 		),
@@ -85,7 +87,10 @@ export function parseCodexUsage(payload) {
 				? undefined
 				: Math.floor(availableResetCredits),
 	};
-	if (!snapshot.primary && !snapshot.secondary && snapshot.resetCredits === undefined) return undefined;
+	if (
+		!snapshot.primary && !snapshot.secondary && snapshot.resetCredits === undefined &&
+		snapshot.allowed === undefined && !snapshot.limitReached
+	) return undefined;
 	return snapshot;
 }
 
@@ -123,15 +128,21 @@ function getWindowResetAt(window, now) {
 	);
 }
 
-export function getQuotaResetAt(snapshot, now = Date.now()) {
+export function getQuotaResetAt(snapshot, now = Date.now(), checkedAt = now) {
+	if (!isQuotaExhausted(snapshot)) return undefined;
 	const exhaustedResets = [snapshot?.primary, snapshot?.secondary]
 		.filter((window) => window?.usedPercent >= 100)
-		.map((window) => getWindowResetAt(window, now))
-		.filter((value) => value !== undefined && value > now);
-	return exhaustedResets.length > 0 ? Math.min(...exhaustedResets) : undefined;
+		.map((window) => getWindowResetAt(window, checkedAt));
+	if (exhaustedResets.length === 0 || exhaustedResets.some((value) => !Number.isFinite(value))) {
+		return undefined;
+	}
+	const resetAt = Math.max(...exhaustedResets);
+	return resetAt > now ? resetAt : undefined;
 }
 
 export function isQuotaExhausted(snapshot) {
+	if (typeof snapshot?.allowed === "boolean") return !snapshot.allowed;
+	if (snapshot?.limitReached) return true;
 	return [snapshot?.primary, snapshot?.secondary].some(
 		(window) => window && asFiniteNumber(window.usedPercent) !== undefined && window.usedPercent >= 100,
 	);

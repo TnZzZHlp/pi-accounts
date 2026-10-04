@@ -1,4 +1,7 @@
-import { CODEX_API } from "./constants.js";
+import timers from "node:timers/promises";
+
+import { NoManagedAccountsError } from "./account-manager.js";
+import { CODEX_API, DEFAULT_LIMIT_COOLDOWN_MS } from "./constants.js";
 
 export const BASE_PROVIDER_SYMBOL = Symbol.for("pi-accounts.base-provider");
 
@@ -57,11 +60,11 @@ function emptyUsage() {
 	};
 }
 
-function errorEvent(model, error) {
+function errorEvent(model, error, aborted = false) {
 	const message = error instanceof Error ? error.message : String(error);
 	return {
 		type: "error",
-		reason: "error",
+		reason: aborted ? "aborted" : "error",
 		error: {
 			role: "assistant",
 			content: [],
@@ -69,7 +72,7 @@ function errorEvent(model, error) {
 			provider: model.provider,
 			model: model.id,
 			usage: emptyUsage(),
-			stopReason: "error",
+			stopReason: aborted ? "aborted" : "error",
 			errorMessage: message,
 			timestamp: Date.now(),
 		},
@@ -101,25 +104,57 @@ function isMeaningfulEvent(event) {
 	return !["start", "done", "error"].includes(event?.type);
 }
 
-function relayManagedStream(baseProvider, method, manager, model, context, options = {}) {
+function relayManagedStream(baseProvider, method, manager, model, context, options = {}, lifecycle = {}) {
+	const signals = [options.signal, lifecycle.signal].filter(Boolean);
+	const signal = signals.length > 0 ? AbortSignal.any(signals) : undefined;
+	options = { ...options, signal };
 	const relay = new RelayMessageEventStream();
+	let partial;
+	const reportWait = (plan) => {
+		try {
+			lifecycle.onWait?.(plan);
+		} catch {}
+	};
+	const onAbort = () => {
+		const terminal = errorEvent(model, signal.reason ?? new Error("Codex request cancelled"), true);
+		if (partial) {
+			terminal.error = { ...partial, stopReason: "aborted", errorMessage: terminal.error.errorMessage };
+		}
+		relay.push(terminal);
+		relay.end();
+		reportWait(undefined);
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
 	void (async () => {
 		const attemptedAliases = new Set();
 		let startForwarded = false;
 		let lastTerminal;
 		try {
-			const accountCount = await manager.getAccountCount();
-			if (accountCount === 0) throw new Error("No Codex account is configured; run /account add");
-			while (attemptedAliases.size < accountCount) {
+			signal?.throwIfAborted();
+			if ((await manager.getAccountCount()) === 0) throw new Error("No Codex account is configured; run /account add");
+			while (true) {
+				signal?.throwIfAborted();
 				let account;
 				try {
 					account = await manager.prepareAttempt({
 						excludeAliases: attemptedAliases,
 						checkQuota: true,
-						allowExhausted: attemptedAliases.size === 0,
+						allowExhausted: false,
 						signal: options.signal,
 					});
 				} catch (error) {
+					signal?.throwIfAborted();
+					if (error instanceof NoManagedAccountsError) {
+						const plan = await manager.getQuotaWaitPlan({ signal });
+						if (plan) {
+							reportWait(plan);
+							const delay = Math.max(1, Math.min(plan.until - manager.now(), DEFAULT_LIMIT_COOLDOWN_MS));
+							await timers.setTimeout(delay, undefined, { signal });
+							await manager.getQuotaWaitPlan({ refresh: true, signal });
+							attemptedAliases.clear();
+							continue;
+						}
+					}
 					if (lastTerminal) {
 						relay.push(lastTerminal);
 						relay.end();
@@ -127,6 +162,8 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 					}
 					throw error;
 				}
+				signal?.throwIfAborted();
+				reportWait(undefined);
 				attemptedAliases.add(account.alias);
 				let responseStatus;
 				let responseHeaders;
@@ -151,6 +188,7 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 						if (event.type === "start") {
 							if (!startForwarded) {
 								startForwarded = true;
+								partial = event.partial;
 								relay.push(event);
 							}
 							continue;
@@ -166,6 +204,7 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 							break;
 						}
 						if (isMeaningfulEvent(event)) meaningfulOutput = true;
+						partial = event.partial ?? partial;
 						relay.push(event);
 					}
 				} catch (error) {
@@ -174,37 +213,33 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 				terminal ??= errorEvent(model, new Error("Codex provider stream ended without a result"));
 				lastTerminal = terminal;
 				const failureKind = classifySwitchableFailure(responseStatus, terminalMessage(terminal));
-				const canSwitch =
-					failureKind &&
-					!meaningfulOutput &&
-					!options.signal?.aborted &&
-					attemptedAliases.size < accountCount;
-				if (!canSwitch) {
-					relay.push(terminal);
-					relay.end();
-					return;
-				}
+				signal?.throwIfAborted();
 				if (failureKind === "quota") {
 					await manager.noteLimited(account.alias, {
 						headers: responseHeaders,
 						reason: terminalMessage(terminal),
 					});
-				} else {
+				} else if (failureKind === "unavailable") {
 					await manager.noteUnavailable(account.alias, { reason: terminalMessage(terminal) });
 				}
+				if (!failureKind || meaningfulOutput || terminal.reason === "aborted") {
+					relay.push(terminal);
+					relay.end();
+					return;
+				}
 			}
-			if (lastTerminal) relay.push(lastTerminal);
-			else relay.push(errorEvent(model, new Error("No managed Codex account could serve the request")));
-			relay.end();
 		} catch (error) {
-			relay.push(errorEvent(model, error));
+			relay.push(errorEvent(model, error, signal?.aborted));
 			relay.end();
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+			reportWait(undefined);
 		}
 	})();
 	return relay;
 }
 
-export function createManagedProvider(providerValue, manager) {
+export function createManagedProvider(providerValue, manager, lifecycle = {}) {
 	const baseProvider = providerValue?.[BASE_PROVIDER_SYMBOL] ?? providerValue;
 	if (!baseProvider?.id || typeof baseProvider.stream !== "function") {
 		throw new Error("Cannot wrap an invalid openai-codex provider");
@@ -217,9 +252,9 @@ export function createManagedProvider(providerValue, manager) {
 		auth: baseProvider.auth,
 		getModels: () => baseProvider.getModels(),
 		stream: (model, context, options) =>
-			relayManagedStream(baseProvider, "stream", manager, model, context, options),
+			relayManagedStream(baseProvider, "stream", manager, model, context, options, lifecycle),
 		streamSimple: (model, context, options) =>
-			relayManagedStream(baseProvider, "streamSimple", manager, model, context, options),
+			relayManagedStream(baseProvider, "streamSimple", manager, model, context, options, lifecycle),
 	};
 	if (typeof baseProvider.refreshModels === "function") {
 		provider.refreshModels = (context) => baseProvider.refreshModels(context);
@@ -239,6 +274,7 @@ export function createManagedProvider(providerValue, manager) {
 				model,
 				undefined,
 				options,
+				lifecycle,
 			);
 	}
 	if (typeof baseProvider.cancelDeferred === "function") {
