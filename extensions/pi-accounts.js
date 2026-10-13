@@ -50,7 +50,7 @@ function activeAccount(view) {
 	return view.accounts.find((account) => account.active);
 }
 
-function formatFooter(view, now = Date.now()) {
+function formatAccountStatus(view, now = Date.now()) {
 	if (view.accounts.length === 0) return "accounts: /accounts add";
 	const active = activeAccount(view);
 	if (!active) return "accounts: no active account selected";
@@ -195,19 +195,26 @@ export function createPiAccountsExtension(options = {}) {
 				quotaTtlMs: options.quotaTtlMs,
 				refreshSkewMs: options.refreshSkewMs,
 				onChange: () => {
-					if (currentContext && !shuttingDown) void updateFooter(currentContext);
+					if (currentContext && !shuttingDown) void updateAccountStatus(currentContext);
 				},
 			});
 
-		async function updateFooter(ctx) {
+		async function updateAccountStatus(ctx) {
 			if (ctx.hasUI === false || shuttingDown) return undefined;
 			try {
-				ctx.ui.setStatus(STATUS_KEY, formatFooter(await manager.getView(), now()));
+				const text = formatAccountStatus(await manager.getView(), now());
+				if (shuttingDown) return undefined;
+				if (ctx.mode === "tui") {
+					ctx.ui.setWidget(STATUS_KEY, [text], { placement: "belowEditor" });
+					ctx.ui.setStatus(STATUS_KEY, undefined);
+				} else {
+					ctx.ui.setStatus(STATUS_KEY, text);
+				}
 				return undefined;
 			} catch (error) {
 				return (
 					asText(error instanceof Error ? error.message : String(error))?.slice(0, 200) ??
-					"unknown footer status error"
+					"unknown account status error"
 				);
 			}
 		}
@@ -224,13 +231,13 @@ export function createPiAccountsExtension(options = {}) {
 					includeResetCreditDetails: true,
 				});
 				const view = await manager.getView();
-				const footerError = await updateFooter(ctx);
+				const statusError = await updateAccountStatus(ctx);
 				const details = formatCodexStatus(view, now());
 				if (details) {
 					notify(
 						ctx,
-						footerError ? `${details}\nFooter status error: ${footerError}` : details,
-						footerError ? "warning" : "info",
+						statusError ? `${details}\nAccount status error: ${statusError}` : details,
+						statusError ? "warning" : "info",
 					);
 					return;
 				}
@@ -272,7 +279,7 @@ export function createPiAccountsExtension(options = {}) {
 				);
 			}
 			const view = await manager.getView();
-			await updateFooter(ctx);
+			await updateAccountStatus(ctx);
 			notify(ctx, formatAccountList(view), view.accounts.some((account) => account.quotaError) ? "warning" : "info");
 		}
 
@@ -290,7 +297,7 @@ export function createPiAccountsExtension(options = {}) {
 				const account = await manager.addCredential(credential, alias);
 				await refreshModelRegistry(ctx);
 				await manager.refreshAll({ force: true }).catch(() => undefined);
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 				notify(ctx, `Added and selected Codex account "${account.alias}".`);
 			} finally {
 				controller.abort();
@@ -301,7 +308,7 @@ export function createPiAccountsExtension(options = {}) {
 		async function selectAccount(ctx, alias) {
 			const account = await manager.use(alias);
 			await refreshModelRegistry(ctx);
-			await updateFooter(ctx);
+			await updateAccountStatus(ctx);
 			notify(
 				ctx,
 				`Selected Codex account "${account.alias}"${ctx.isIdle() ? "." : " for the next provider request."}`,
@@ -311,7 +318,7 @@ export function createPiAccountsExtension(options = {}) {
 
 		async function renameAccount(ctx, oldAlias, newAlias) {
 			const account = await manager.rename(oldAlias, newAlias);
-			await updateFooter(ctx);
+			await updateAccountStatus(ctx);
 			notify(ctx, `Renamed Codex account to "${account.alias}".`);
 			return account;
 		}
@@ -358,7 +365,7 @@ export function createPiAccountsExtension(options = {}) {
 					);
 					return;
 				}
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 				if (!result.refreshed) {
 					notify(
 						ctx,
@@ -388,7 +395,7 @@ export function createPiAccountsExtension(options = {}) {
 			}
 			const account = await manager.remove(alias);
 			await refreshModelRegistry(ctx);
-			await updateFooter(ctx);
+			await updateAccountStatus(ctx);
 			notify(ctx, `Removed Codex account "${account.alias}".`, "warning");
 			return account;
 		}
@@ -457,7 +464,7 @@ export function createPiAccountsExtension(options = {}) {
 						}),
 					),
 				);
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 			}
 			while (true) {
 				const view = await manager.getView();
@@ -485,7 +492,7 @@ export function createPiAccountsExtension(options = {}) {
 					if (choice === refreshLabel) {
 						notify(ctx, "Refreshing Codex account quotas…");
 						await manager.refreshAll({ force: true, includeResetCreditDetails: true });
-						await updateFooter(ctx);
+						await updateAccountStatus(ctx);
 						continue;
 					}
 					if (choice === autoLabel) {
@@ -501,7 +508,7 @@ export function createPiAccountsExtension(options = {}) {
 							),
 						);
 						await refreshModelRegistry(ctx);
-						await updateFooter(ctx);
+						await updateAccountStatus(ctx);
 						notify(ctx, `Auto-selected Codex account "${account.alias}".`);
 						continue;
 					}
@@ -514,7 +521,7 @@ export function createPiAccountsExtension(options = {}) {
 						const value = await ctx.ui.input("Import current Codex login", "optional alias");
 						if (value === undefined) continue;
 						const account = await manager.importCurrent(asText(value), { makeActive: true });
-						await updateFooter(ctx);
+						await updateAccountStatus(ctx);
 						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
 					}
 				} catch (error) {
@@ -552,7 +559,7 @@ export function createPiAccountsExtension(options = {}) {
 					case "import": {
 						if (parsed.args.length > 1) throw new Error("Usage: /accounts import [alias]");
 						const account = await manager.importCurrent(parsed.args[0], { makeActive: true });
-						await updateFooter(ctx);
+						await updateAccountStatus(ctx);
 						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
 						return;
 					}
@@ -564,7 +571,7 @@ export function createPiAccountsExtension(options = {}) {
 					case "auto": {
 						const account = await manager.chooseAuto();
 						await refreshModelRegistry(ctx);
-						await updateFooter(ctx);
+						await updateAccountStatus(ctx);
 						notify(ctx, `Auto-selected Codex account "${account.alias}".`);
 						return;
 					}
@@ -656,15 +663,15 @@ export function createPiAccountsExtension(options = {}) {
 					},
 				}));
 				await refreshModelRegistry(ctx);
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 				if (pollTimer) clearInterval(pollTimer);
 				pollTimer = setInterval(() => {
-					void manager.refreshAll({ force: false }).then(() => updateFooter(ctx));
+					void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx));
 				}, options.pollIntervalMs ?? QUOTA_POLL_INTERVAL_MS);
 				pollTimer.unref?.();
 			} catch (error) {
 				notify(ctx, `pi-accounts initialization failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 			}
 		});
 
@@ -673,7 +680,7 @@ export function createPiAccountsExtension(options = {}) {
 			if (!isCodexModel(ctx.model)) return;
 			try {
 				await manager.ensureReady({ checkQuota: true, signal: ctx.signal });
-				await updateFooter(ctx);
+				await updateAccountStatus(ctx);
 			} catch (error) {
 				notify(ctx, error instanceof Error ? error.message : String(error), "warning");
 			}
@@ -682,7 +689,7 @@ export function createPiAccountsExtension(options = {}) {
 		pi.on("model_select", async (_event, ctx) => {
 			currentContext = ctx;
 			apiRateLimits = undefined;
-			await updateFooter(ctx);
+			await updateAccountStatus(ctx);
 		});
 
 		pi.on("after_provider_response", (event, ctx) => {
@@ -695,7 +702,7 @@ export function createPiAccountsExtension(options = {}) {
 		pi.on("agent_end", (_event, ctx) => {
 			currentContext = ctx;
 			if (isCodexModel(ctx.model)) {
-				void manager.refreshAll({ force: false }).then(() => updateFooter(ctx));
+				void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx));
 			}
 		});
 
@@ -708,6 +715,7 @@ export function createPiAccountsExtension(options = {}) {
 			if (ctx.hasUI !== false) {
 				ctx.ui.setStatus("pi-accounts-wait", undefined);
 				ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
+				if (ctx.mode === "tui") ctx.ui.setWidget(STATUS_KEY, undefined);
 				ctx.ui.setStatus(STATUS_KEY, undefined);
 			}
 		});

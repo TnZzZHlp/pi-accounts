@@ -23,7 +23,8 @@ test("registers commands and drives account management through the interactive T
 	const widgets = [];
 	const selectResponses = [];
 	const inputResponses = [];
-	let footerFailure = false;
+	let statusFailure = false;
+	const accountWidget = () => widgets.filter((entry) => entry.key === "pi-accounts").at(-1);
 	const baseProvider = {
 		id: "openai-codex",
 		name: "OpenAI Codex",
@@ -68,6 +69,7 @@ test("registers commands and drives account management through the interactive T
 		},
 	};
 	const ctx = {
+		mode: "tui",
 		hasUI: true,
 		model: { provider: "openai-codex", id: "gpt-test", api: "openai-codex-responses" },
 		signal: undefined,
@@ -78,14 +80,14 @@ test("registers commands and drives account management through the interactive T
 		},
 		ui: {
 			setStatus(key, text) {
-				if (footerFailure) throw new Error("status unavailable");
 				statuses.push({ key, text });
 			},
 			notify(message, type) {
 				notifications.push({ message, type });
 			},
-			setWidget(key, content) {
-				widgets.push({ key, content });
+			setWidget(key, content, options) {
+				if (key === "pi-accounts" && statusFailure) throw new Error("status unavailable");
+				widgets.push({ key, content, options });
 			},
 			select(title, options) {
 				const response = selectResponses.shift();
@@ -118,16 +120,20 @@ test("registers commands and drives account management through the interactive T
 		await events.get("session_start")({}, ctx);
 		assert.equal(providers.length, 1);
 		assert.equal(providers[0].id, "openai-codex");
-		assert.equal(statuses.at(-1).text, "alpha · 1h 80% · 1d 90%");
+		assert.deepEqual(accountWidget(), {
+			key: "pi-accounts",
+			content: ["alpha · 1h 80% · 1d 90%"],
+			options: { placement: "belowEditor" },
+		});
 
 		await commands.get("accounts").handler("add beta", ctx);
 		assert.equal(widgets.some((entry) => entry.content?.includes("Device code: ABCD-EFGH")), true);
 		assert.equal(notifications.some((entry) => entry.message.includes("Device code: ABCD-EFGH")), false);
-		assert.equal(statuses.at(-1).text, "beta · 1h 70% · 1d 90%");
+		assert.equal(accountWidget().content[0], "beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Added and selected Codex account "beta"/.test(entry.message)), true);
 
 		await commands.get("accounts").handler("use alpha", ctx);
-		assert.equal(statuses.at(-1).text, "alpha · 1h 80% · 1d 90%");
+		assert.equal(accountWidget().content[0], "alpha · 1h 80% · 1d 90%");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
 
@@ -140,7 +146,7 @@ test("registers commands and drives account management through the interactive T
 			"Close",
 		);
 		await commands.get("accounts").handler("", ctx);
-		assert.equal(statuses.at(-1).text, "beta · 1h 70% · 1d 90%");
+		assert.equal(accountWidget().content[0], "beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Selected Codex account "beta"/.test(entry.message)), true);
 		await commands.get("accounts").handler("use alpha", ctx);
 
@@ -177,17 +183,17 @@ test("registers commands and drives account management through the interactive T
 			true,
 		);
 
-		footerFailure = true;
+		statusFailure = true;
 		await commands.get("accounts").handler("status", ctx);
 		assert.equal(
 			notifications.some(
 				(entry) =>
 					entry.type === "warning" &&
-					entry.message.endsWith("\nFooter status error: status unavailable"),
+					entry.message.endsWith("\nAccount status error: status unavailable"),
 			),
 			true,
 		);
-		footerFailure = false;
+		statusFailure = false;
 
 		ctx.model = { provider: "openai", id: "gpt-5.4", api: "openai-responses" };
 		await events.get("model_select")({}, ctx);
@@ -211,6 +217,8 @@ test("registers commands and drives account management through the interactive T
 		events.get("session_shutdown")?.({}, ctx);
 		await rm(agentDir, { recursive: true, force: true });
 	}
+	assert.equal(accountWidget().content, undefined);
+	assert.ok(statuses.filter((entry) => entry.key === "pi-accounts").every((entry) => entry.text === undefined));
 });
 
 test("lists accounts after a failed quota check while its empty snapshot is cached", async () => {
