@@ -204,7 +204,7 @@ test("automatically rotates from an exhausted account without switching Pi's sha
 			await manager.addCredential(alpha, "work");
 			await manager.addCredential(beta, "personal");
 			await manager.use("work");
-			const selected = await manager.ensureReady({ checkQuota: true });
+			const selected = await manager.chooseAuto();
 			assert.equal(selected.alias, "personal");
 			assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
 			const view = await manager.getView();

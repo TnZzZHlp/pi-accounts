@@ -122,31 +122,31 @@ test("registers commands and drives account management through the interactive T
 		assert.equal(providers[0].id, "openai-codex");
 		assert.deepEqual(accountWidget(), {
 			key: "pi-accounts",
-			content: ["alpha · 1h 80% · 1d 90%"],
+			content: ["auto · alpha · 1h 80% · 1d 90%"],
 			options: { placement: "belowEditor" },
 		});
 
 		await commands.get("accounts").handler("add beta", ctx);
 		assert.equal(widgets.some((entry) => entry.content?.includes("Device code: ABCD-EFGH")), true);
 		assert.equal(notifications.some((entry) => entry.message.includes("Device code: ABCD-EFGH")), false);
-		assert.equal(accountWidget().content[0], "beta · 1h 70% · 1d 90%");
+		assert.equal(accountWidget().content[0], "auto · beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Added and selected Codex account "beta"/.test(entry.message)), true);
 
 		await commands.get("accounts").handler("use alpha", ctx);
-		assert.equal(accountWidget().content[0], "alpha · 1h 80% · 1d 90%");
+		assert.equal(accountWidget().content[0], "specified · alpha · 1h 80% · 1d 90%");
 		await commands.get("accounts").handler("list", ctx);
 		assert.equal(notifications.some((entry) => /Codex accounts \(2\)/.test(entry.message)), true);
 
 		selectResponses.push(
 			({ title, options }) => {
-				assert.equal(title, "Codex account manager");
+				assert.equal(title, "Codex account manager (specified)");
 				return options.find((option) => option.includes("beta"));
 			},
 			"Use this account",
 			"Close",
 		);
 		await commands.get("accounts").handler("", ctx);
-		assert.equal(accountWidget().content[0], "beta · 1h 70% · 1d 90%");
+		assert.equal(accountWidget().content[0], "specified · beta · 1h 70% · 1d 90%");
 		assert.equal(notifications.some((entry) => /Selected Codex account "beta"/.test(entry.message)), true);
 		await commands.get("accounts").handler("use alpha", ctx);
 

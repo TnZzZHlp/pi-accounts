@@ -1,4 +1,5 @@
 import { setTimeout } from "node:timers/promises";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { readPiCodexCredential } from "../../extensions/lib/account-store.js";
@@ -7,8 +8,13 @@ import { NOW } from "../helpers.js";
 
 const MODEL = { provider: "openai-codex", id: "gpt-test", api: "openai-codex-responses" };
 
-async function runAccountProcess(agentDir, origin) {
+async function runAccountProcess(agentDir, origin, originalSessionId = String(process.pid)) {
 	let now = NOW;
+	let sessionId = originalSessionId;
+	const sessionPath = () => join(agentDir, `test-session-${sessionId}.jsonl`);
+	const branch = () => existsSync(sessionPath())
+		? readFileSync(sessionPath(), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+		: [];
 	let generation = 0;
 	let manager;
 	let provider;
@@ -66,6 +72,8 @@ async function runAccountProcess(agentDir, origin) {
 	}
 
 	async function load(reason = "startup") {
+		if (reason === "new") sessionId = `${originalSessionId}-new-${generation}`;
+		if (reason === "resume") sessionId = originalSessionId;
 		const moduleUrl = new URL("../../extensions/pi-accounts.js", import.meta.url);
 		moduleUrl.searchParams.set("runtime", String(generation++));
 		const { createPiAccountsExtension } = await import(moduleUrl.href);
@@ -74,6 +82,7 @@ async function runAccountProcess(agentDir, origin) {
 		notifications = [];
 		statuses = new Map();
 		ctx = {
+			sessionManager: { getBranch: branch },
 			hasUI: true,
 			model: MODEL,
 			isIdle: () => true,
@@ -98,6 +107,9 @@ async function runAccountProcess(agentDir, origin) {
 			on: (name, handler) => handlers.set(name, handler),
 			registerCommand: (name, command) => commands.set(name, command),
 			registerProvider: (value) => { provider = value; },
+			appendEntry: (customType, data) => appendFileSync(sessionPath(), `${JSON.stringify({
+				type: "custom", customType, data,
+			})}\n`, { mode: 0o600 }),
 		}));
 		const getView = manager.getView.bind(manager);
 		manager.getView = async () => {
@@ -111,7 +123,7 @@ async function runAccountProcess(agentDir, origin) {
 		await handlers.get("session_start")({ reason }, ctx);
 		const error = notifications.find((entry) => entry.type === "error");
 		if (error) throw new Error(error.message);
-		return manager.getView();
+		return { ...await manager.getView(), sessionId };
 	}
 
 	async function dispatch(action, value) {
@@ -186,5 +198,5 @@ async function runAccountProcess(agentDir, origin) {
 }
 
 if (process.env.PI_ACCOUNTS_TEST_PROCESS === "1") {
-	await runAccountProcess(process.argv[2], process.argv[3]);
+	await runAccountProcess(process.argv[2], process.argv[3], process.argv[4]);
 }

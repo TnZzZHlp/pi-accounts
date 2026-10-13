@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
 import { AccountManager } from "./lib/account-manager.js";
+import { SELECTION_ENTRY_TYPE } from "./lib/account-selection.js";
 import { AccountStore } from "./lib/account-store.js";
 import {
 	formatOpenAiRateLimitStatus,
@@ -53,13 +54,16 @@ function activeAccount(view) {
 function formatAccountStatus(view, now = Date.now()) {
 	if (view.accounts.length === 0) return "accounts: /accounts add";
 	const active = activeAccount(view);
-	if (!active) return "accounts: no active account selected";
+	const mode = view.mode ?? "auto";
+	if (!active) return mode === "specified"
+		? "accounts: specified account unavailable; /accounts use or auto"
+		: "accounts: no active account selected";
 	const quota = formatQuotaStatusBar(active.quota, now);
-	if (quota) return `${active.alias} · ${quota}`;
+	if (quota) return `${mode} · ${active.alias} · ${quota}`;
 	if (active.cooldown) {
-		return `${active.alias} · ${active.cooldown.kind} ${formatRemainingTime(active.cooldown.until - now)}`;
+		return `${mode} · ${active.alias} · ${active.cooldown.kind} ${formatRemainingTime(active.cooldown.until - now)}`;
 	}
-	return `${active.alias} · quota unavailable`;
+	return `${mode} · ${active.alias} · quota unavailable`;
 }
 
 function formatCodexStatus(view, now = Date.now()) {
@@ -89,7 +93,7 @@ function formatAccountList(view) {
 		const error = account.quotaError ? `; quota check: ${account.quotaError}` : "";
 		return `${marker} ${account.alias}${identity ? ` (${identity})` : ""}: ${quota}${cooldown}${error}`;
 	});
-	return [`Codex accounts (${view.accounts.length}):`, ...lines].join("\n");
+	return [`Codex accounts (${view.accounts.length}):`, `Mode: ${view.mode ?? "auto"}`, ...lines].join("\n");
 }
 
 function formatTuiAccount(account, now = Date.now()) {
@@ -160,8 +164,8 @@ function commandHelp() {
 		"/accounts list — list accounts and quota",
 		"/accounts add [alias] — sign in to another ChatGPT Codex account",
 		"/accounts import [alias] — import Pi's current openai-codex login",
-		"/accounts use <alias> — manually select the account used next",
-		"/accounts auto — select the next account with quota",
+		"/accounts use <alias> — specify one account for this session; wait when its quota is exhausted",
+		"/accounts auto — enable automatic account selection for this session",
 		"/accounts refresh — refresh quota for every account",
 		"/accounts status — show detailed GPT quota status",
 		"/accounts rename <old> <new> — rename an alias",
@@ -199,6 +203,12 @@ export function createPiAccountsExtension(options = {}) {
 				},
 			});
 
+		if (manager.selection) {
+			manager.selection.onChange = (selection) => {
+				if (currentContext && !shuttingDown) pi.appendEntry?.(SELECTION_ENTRY_TYPE, selection);
+			};
+		}
+
 		async function updateAccountStatus(ctx) {
 			if (ctx.hasUI === false || shuttingDown) return undefined;
 			try {
@@ -217,6 +227,15 @@ export function createPiAccountsExtension(options = {}) {
 					"unknown account status error"
 				);
 			}
+		}
+
+		function refreshAccountStatusInBackground(ctx) {
+			const selectionSignal = manager.selection?.signal;
+			void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx)).catch((error) => {
+				if (shuttingDown || (selectionSignal?.aborted && error?.name === "AbortError")) return;
+				const message = error instanceof Error ? error.message : String(error);
+				notify(ctx, `Codex quota refresh failed: ${message}`, "warning");
+			});
 		}
 
 		async function showQuotaStatus(ctx) {
@@ -298,7 +317,8 @@ export function createPiAccountsExtension(options = {}) {
 				await refreshModelRegistry(ctx);
 				await manager.refreshAll({ force: true }).catch(() => undefined);
 				await updateAccountStatus(ctx);
-				notify(ctx, `Added and selected Codex account "${account.alias}".`);
+				const selected = (await manager.getView()).active === account.alias;
+				notify(ctx, `Added${selected ? " and selected" : ""} Codex account "${account.alias}".`);
 			} finally {
 				controller.abort();
 				ctx.ui.setWidget(LOGIN_WIDGET_KEY, undefined);
@@ -311,7 +331,7 @@ export function createPiAccountsExtension(options = {}) {
 			await updateAccountStatus(ctx);
 			notify(
 				ctx,
-				`Selected Codex account "${account.alias}"${ctx.isIdle() ? "." : " for the next provider request."}`,
+				`Selected Codex account "${account.alias}" (specified mode).`,
 			);
 			return account;
 		}
@@ -408,7 +428,7 @@ export function createPiAccountsExtension(options = {}) {
 				if (!account) return;
 				const details = formatQuotaDetails(account.quota, now());
 				const choices = [
-					...(account.active ? [] : ["Use this account"]),
+					...(account.active && view.mode === "specified" ? [] : ["Use this account"]),
 					"Consume one reset credit",
 					"Rename account",
 					"Remove account",
@@ -474,7 +494,7 @@ export function createPiAccountsExtension(options = {}) {
 				const accountOptions = new Map(
 					orderedAccounts.map((account) => [formatTuiAccount(account, now()), account.alias]),
 				);
-				const choice = await ctx.ui.select("Codex account manager", [
+				const choice = await ctx.ui.select(`Codex account manager (${view.mode ?? "auto"})`, [
 					...accountOptions.keys(),
 					refreshLabel,
 					autoLabel,
@@ -522,7 +542,8 @@ export function createPiAccountsExtension(options = {}) {
 						if (value === undefined) continue;
 						const account = await manager.importCurrent(asText(value), { makeActive: true });
 						await updateAccountStatus(ctx);
-						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
+						const selected = (await manager.getView()).active === account.alias;
+						notify(ctx, `Imported${selected ? " and selected" : ""} Codex account "${account.alias}".`);
 					}
 				} catch (error) {
 					notify(ctx, error instanceof Error ? error.message : String(error), "error");
@@ -560,7 +581,8 @@ export function createPiAccountsExtension(options = {}) {
 						if (parsed.args.length > 1) throw new Error("Usage: /accounts import [alias]");
 						const account = await manager.importCurrent(parsed.args[0], { makeActive: true });
 						await updateAccountStatus(ctx);
-						notify(ctx, `Imported and selected Codex account "${account.alias}".`);
+						const selected = (await manager.getView()).active === account.alias;
+						notify(ctx, `Imported${selected ? " and selected" : ""} Codex account "${account.alias}".`);
 						return;
 					}
 					case "use": {
@@ -652,6 +674,7 @@ export function createPiAccountsExtension(options = {}) {
 			baseProvider = provider[BASE_PROVIDER_SYMBOL] ?? provider;
 			try {
 				manager.setProvider(baseProvider);
+				await manager.restoreSelection(ctx);
 				await manager.initialize({ checkQuota: true });
 				pi.registerProvider(createManagedProvider(baseProvider, manager, {
 					signal: sessionController.signal,
@@ -665,14 +688,19 @@ export function createPiAccountsExtension(options = {}) {
 				await refreshModelRegistry(ctx);
 				await updateAccountStatus(ctx);
 				if (pollTimer) clearInterval(pollTimer);
-				pollTimer = setInterval(() => {
-					void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx));
-				}, options.pollIntervalMs ?? QUOTA_POLL_INTERVAL_MS);
+				pollTimer = setInterval(() => refreshAccountStatusInBackground(ctx), options.pollIntervalMs ?? QUOTA_POLL_INTERVAL_MS);
 				pollTimer.unref?.();
 			} catch (error) {
 				notify(ctx, `pi-accounts initialization failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 				await updateAccountStatus(ctx);
 			}
+		});
+
+		pi.on("session_tree", async (_event, ctx) => {
+			currentContext = ctx;
+			await manager.restoreSelection(ctx);
+			await manager.initialize({ checkQuota: true });
+			await updateAccountStatus(ctx);
 		});
 
 		pi.on("before_agent_start", async (_event, ctx) => {
@@ -701,9 +729,7 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("agent_end", (_event, ctx) => {
 			currentContext = ctx;
-			if (isCodexModel(ctx.model)) {
-				void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx));
-			}
+			if (isCodexModel(ctx.model)) refreshAccountStatusInBackground(ctx);
 		});
 
 		pi.on("session_shutdown", (_event, ctx) => {

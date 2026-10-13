@@ -4,7 +4,6 @@ const PROCESS_STATE_SYMBOL = Symbol.for("pi-accounts.process-state.v1");
 
 export function createAccountRuntime() {
 	return {
-		activeAccountId: null,
 		initialized: false,
 		quota: new Map(),
 		cooldowns: new Map(),

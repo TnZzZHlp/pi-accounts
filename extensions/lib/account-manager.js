@@ -19,6 +19,7 @@ import {
 	syncPiCodexCredential,
 } from "./account-store.js";
 import { createAccountRuntime } from "./process-state.js";
+import { AccountSelection } from "./account-selection.js";
 import {
 	consumeCodexResetCredit,
 	fetchCodexResetCreditExpiries,
@@ -41,6 +42,12 @@ function cloneAccount(account) {
 	return account ? structuredClone(account) : undefined;
 }
 
+function combineSignals(...signals) {
+	const active = signals.filter(Boolean);
+	if (active.length === 0) return undefined;
+	return active.length === 1 ? active[0] : AbortSignal.any(active);
+}
+
 export class AccountManager {
 	constructor(options) {
 		this.store = options.store;
@@ -52,8 +59,14 @@ export class AccountManager {
 		this.onChange = options.onChange;
 		this.provider = undefined;
 		this.runtime = options.runtime ?? createAccountRuntime();
+		this.selection = options.selection ?? new AccountSelection();
 		this.quota = this.runtime.quota;
 		this.cooldowns = this.runtime.cooldowns;
+	}
+
+	restoreSelection(ctx) {
+		this.selection.restore(ctx);
+		this._emitChange();
 	}
 
 	setProvider(provider) {
@@ -89,17 +102,25 @@ export class AccountManager {
 
 	async initialize(options = {}) {
 		return this._serialized(async () => {
-			if (this.runtime.initialized) return this._viewFromState(await this.store.load());
-			await this._importCurrent(undefined, { replaceExisting: false });
+			const selectionRevision = this.selection.revision;
+			if (!this.runtime.initialized) {
+				await this._importCurrent(undefined, { replaceExisting: false });
+			}
 			const state = await this.store.load();
 			const current = this._activeAccount(state) ??
 				(state.active ? findAccount(state, state.active) : undefined) ?? state.accounts[0];
-			this.runtime.activeAccountId = current?.accountId ?? null;
+			if (this.selection.mode === "auto") this.selection.activate(current?.accountId ?? null);
 			if (state.accounts.length > 0) {
 				try {
 					await this._select({ checkQuota: options.checkQuota !== false, allowExhausted: true });
 				} catch {
-					if (current) await this._activate(current.alias);
+					if (
+						current &&
+						this.selection.mode === "auto" &&
+						selectionRevision === this.selection.revision
+					) {
+						await this._activate(current.alias);
+					}
 				}
 			}
 			this.runtime.initialized = true;
@@ -109,10 +130,17 @@ export class AccountManager {
 	}
 
 	async importCurrent(alias, options = {}) {
+		const intentRevision = this.selection.intentRevision;
 		return this._serialized(async () => {
 			const account = await this._importCurrent(alias);
 			if (!account) throw new Error("Pi does not currently have an openai-codex OAuth login to import");
-			if (options.makeActive !== false) await this._activate(account.alias);
+			if (
+				options.makeActive !== false &&
+				this.selection.mode === "auto" &&
+				intentRevision === this.selection.intentRevision
+			) {
+				this.selection.activate(account.accountId, { wake: true });
+			}
 			this._emitChange();
 			return cloneAccount(findAccount(await this.store.load(), account.alias));
 		});
@@ -156,6 +184,7 @@ export class AccountManager {
 	}
 
 	async addCredential(credentialValue, requestedAlias) {
+		const intentRevision = this.selection.intentRevision;
 		return this._serialized(async () => {
 			const credential = normalizeOAuthCredential(credentialValue);
 			const accountId = getCredentialAccountId(credential);
@@ -196,20 +225,24 @@ export class AccountManager {
 			});
 			this.cooldowns.delete(aliasKey(outcome.result));
 			const account = findAccount(outcome.state, outcome.result);
-			this.runtime.activeAccountId = account.accountId;
 			await syncPiCodexCredential(this.authPath, account.accountId, account.credential);
+			if (this.selection.mode === "auto" && intentRevision === this.selection.intentRevision) {
+				this.selection.activate(account.accountId, { wake: true });
+			}
 			this._emitChange();
 			return cloneAccount(account);
 		});
 	}
 
 	async use(alias) {
-		return this._serialized(async () => {
-			const account = await this._activate(alias);
+		const account = findAccount(await this.store.load(), alias);
+		if (!account) throw new Error(`Unknown account: ${alias}`);
+		this.selection.set("specified", account.accountId);
+		if (this.cooldowns.get(aliasKey(account.alias))?.kind === "unavailable") {
 			this.cooldowns.delete(aliasKey(account.alias));
-			this._emitChange();
-			return cloneAccount(account);
-		});
+		}
+		this._emitChange();
+		return cloneAccount(account);
 	}
 
 	async rename(oldAlias, newAliasValue) {
@@ -254,8 +287,10 @@ export class AccountManager {
 			});
 			this.quota.delete(aliasKey(outcome.result.alias));
 			this.cooldowns.delete(aliasKey(outcome.result.alias));
-			if (this.runtime.activeAccountId === outcome.result.accountId) {
-				this.runtime.activeAccountId = outcome.state.accounts[0]?.accountId ?? null;
+			if (this.selection.mode === "auto" && this.selection.accountId === outcome.result.accountId) {
+				this.selection.set("auto", outcome.state.accounts[0]?.accountId ?? null);
+			} else if (this.selection.accountId === outcome.result.accountId) {
+				this.selection.set("specified", outcome.result.accountId);
 			}
 			await syncPiCodexCredential(this.authPath, outcome.result.accountId, undefined);
 			this._emitChange();
@@ -264,13 +299,16 @@ export class AccountManager {
 	}
 
 	_activeAccount(state) {
-		return state.accounts.find((account) => account.accountId === this.runtime.activeAccountId);
+		return state.accounts.find((account) => account.accountId === this.selection.accountId);
 	}
 
-	async _activate(alias) {
+	async _activate(alias, options = {}) {
+		const revision = this.selection.revision;
 		const account = findAccount(await this.store.load(), alias);
 		if (!account) throw new Error(`Unknown account: ${alias}`);
-		this.runtime.activeAccountId = account.accountId;
+		options.signal?.throwIfAborted();
+		if (revision !== this.selection.revision) return account;
+		this.selection.activate(account.accountId);
 		return account;
 	}
 
@@ -329,11 +367,13 @@ export class AccountManager {
 			this._emitChange();
 			return cloneAccount(account);
 		} catch (error) {
-			this.cooldowns.set(aliasKey(requestedAccount.alias), {
-				kind: "unavailable",
-				until: this.now() + DEFAULT_UNAVAILABLE_COOLDOWN_MS,
-				reason: error instanceof Error ? error.message : String(error),
-			});
+			if (!options.signal?.aborted) {
+				this.cooldowns.set(aliasKey(requestedAccount.alias), {
+					kind: "unavailable",
+					until: this.now() + DEFAULT_UNAVAILABLE_COOLDOWN_MS,
+					reason: error instanceof Error ? error.message : String(error),
+				});
+			}
 			throw error;
 		}
 	}
@@ -354,6 +394,7 @@ export class AccountManager {
 		const key = aliasKey(accountValue.alias);
 		const cached = this.quota.get(key);
 		if (!options.force && cached && this.now() - cached.checkedAt < this.quotaTtlMs) {
+			if (options.throwOnError && cached.error) throw new Error(cached.error);
 			const snapshot = cached.snapshot;
 			if (
 				!options.includeResetCreditDetails ||
@@ -386,17 +427,20 @@ export class AccountManager {
 					throw error;
 				}
 			}
+			options.signal?.throwIfAborted();
 			if (options.includeResetCreditDetails) {
 				snapshot = await this._fetchResetCreditDetails(account, snapshot, options);
 			}
+			options.signal?.throwIfAborted();
 			const checkedAt = this.now();
 			for (const window of [snapshot.primary, snapshot.secondary]) {
 				if (window && window.resetAt === undefined && Number.isFinite(window.resetAfterSeconds)) {
 					window.resetAt = checkedAt + window.resetAfterSeconds * 1000;
 				}
 			}
-			this.quota.set(key, { snapshot, checkedAt, error: undefined });
 			await this._updateAccountEmail(account.alias, snapshot.email);
+			options.signal?.throwIfAborted();
+			this.quota.set(key, { snapshot, checkedAt, error: undefined });
 			const cooldown = this._isCoolingDown(account.alias);
 			if (isQuotaExhausted(snapshot) && cooldown?.kind !== "unavailable") {
 				const resetAt = getQuotaResetAt(snapshot, this.now());
@@ -438,13 +482,40 @@ export class AccountManager {
 	}
 
 	_orderAccounts(state) {
-		const index = state.accounts.findIndex((account) => account.accountId === this.runtime.activeAccountId);
+		const index = state.accounts.findIndex((account) => account.accountId === this.selection.accountId);
 		if (index < 0) return [...state.accounts];
 		return [...state.accounts.slice(index), ...state.accounts.slice(0, index)];
 	}
 
+	async _selectSpecified(state, options) {
+		const original = this._activeAccount(state);
+		if (!original) throw new Error("The specified Codex account was removed; run /accounts use <alias> or /accounts auto");
+		options.signal?.throwIfAborted();
+		const account = await this._refreshCredential(original, { signal: options.signal });
+		const cooldown = this._isCoolingDown(account.alias);
+		if (cooldown?.kind === "unavailable") throw new Error(cooldown.reason);
+		if (!options.allowExhausted && (cooldown?.kind === "quota" ||
+			[...(options.excludeAliases ?? [])].some((alias) => aliasKey(alias) === aliasKey(account.alias)))) {
+			throw new NoManagedAccountsError(`Specified Codex account "${account.alias}" is exhausted`);
+		}
+		if (options.checkQuota !== false) {
+			const snapshot = await this._fetchQuota(account, { signal: options.signal, throwOnError: true });
+			if (!options.allowExhausted && isQuotaExhausted(snapshot)) {
+				throw new NoManagedAccountsError(`Specified Codex account "${account.alias}" is exhausted`);
+			}
+		}
+		options.signal?.throwIfAborted();
+		const latestState = await this.store.load();
+		options.signal?.throwIfAborted();
+		const latest = latestState.accounts.find((candidate) => candidate.accountId === original.accountId);
+		if (!latest) throw new Error("The specified Codex account was removed; run /accounts use <alias> or /accounts auto");
+		return cloneAccount(latest);
+	}
+
 	async _select(options = {}) {
+		options = { ...options, signal: combineSignals(options.signal, this.selection.signal) };
 		const state = await this.store.load();
+		if (this.selection.mode === "specified") return this._selectSpecified(state, options);
 		if (state.accounts.length === 0) throw new NoManagedAccountsError();
 		const excluded = new Set([...(options.excludeAliases ?? [])].map(aliasKey));
 		const order = this._orderAccounts(state);
@@ -461,7 +532,8 @@ export class AccountManager {
 				const snapshot = await this._fetchQuota(account, { signal: options.signal });
 				if (isQuotaExhausted(snapshot) && !this.quota.get(aliasKey(account.alias))?.error) continue;
 			}
-			return cloneAccount(await this._activate(account.alias));
+			options.signal?.throwIfAborted();
+			return cloneAccount(await this._activate(account.alias, { signal: options.signal }));
 		}
 
 		if (options.allowExhausted) {
@@ -469,7 +541,8 @@ export class AccountManager {
 				if (excluded.has(aliasKey(original.alias))) continue;
 				try {
 					const account = await this._refreshCredential(original, { signal: options.signal });
-					return cloneAccount(await this._activate(account.alias));
+					options.signal?.throwIfAborted();
+					return cloneAccount(await this._activate(account.alias, { signal: options.signal }));
 				} catch {
 					// Try the next credential even if all quota snapshots are exhausted.
 				}
@@ -490,18 +563,26 @@ export class AccountManager {
 	}
 
 	async getQuotaWaitPlan(options = {}) {
+		options = { ...options, signal: combineSignals(options.signal, this.selection.signal) };
 		return this._serialized(async () => {
 			options.signal?.throwIfAborted();
 			const state = await this.store.load();
+			const accounts = this.selection.mode === "specified"
+				? state.accounts.filter((account) => account.accountId === this.selection.accountId)
+				: this._orderAccounts(state);
 			if (options.refresh) {
-				for (const account of state.accounts) {
+				for (const account of accounts) {
 					options.signal?.throwIfAborted();
-					await this._fetchQuota(account, { force: true, signal: options.signal });
+					await this._fetchQuota(account, {
+						force: true,
+						signal: options.signal,
+						throwOnError: this.selection.mode === "specified",
+					});
 				}
 			}
 			const now = this.now();
 			let earliest;
-			for (const account of this._orderAccounts(state)) {
+			for (const account of accounts) {
 				const key = aliasKey(account.alias);
 				const cooldown = this._isCoolingDown(account.alias);
 				if (cooldown?.kind === "unavailable") continue;
@@ -556,9 +637,11 @@ export class AccountManager {
 	}
 
 	async refreshAll(options = {}) {
+		options = { ...options, signal: combineSignals(options.signal, this.selection.signal) };
 		return this._serialized(async () => {
 			const state = await this.store.load();
 			for (const account of state.accounts) {
+				options.signal?.throwIfAborted();
 				await this._fetchQuota(account, {
 					force: options.force !== false,
 					signal: options.signal,
@@ -569,9 +652,11 @@ export class AccountManager {
 				try {
 					await this._select({ checkQuota: true, allowExhausted: true, signal: options.signal });
 				} catch {
+					options.signal?.throwIfAborted();
 					// Preserve the last active account so the footer can report why none is usable.
 				}
 			}
+			options.signal?.throwIfAborted();
 			this._emitChange();
 			return this._viewFromState(await this.store.load());
 		});
@@ -627,8 +712,12 @@ export class AccountManager {
 	}
 
 	async chooseAuto(options = {}) {
-		await this.refreshAll({ force: true, signal: options.signal });
-		return this.prepareAttempt({ checkQuota: true, allowExhausted: true, signal: options.signal });
+		this.selection.set("auto", this.selection.accountId);
+		this._emitChange();
+		const signal = combineSignals(options.signal, this.selection.signal);
+		await this.refreshAll({ force: true, signal });
+		signal?.throwIfAborted();
+		return this.prepareAttempt({ checkQuota: true, allowExhausted: true, signal });
 	}
 
 	async noteLimited(alias, details = {}) {
@@ -690,6 +779,7 @@ export class AccountManager {
 	_viewFromState(state) {
 		const active = this._activeAccount(state);
 		return {
+			mode: this.selection.mode,
 			active: active?.alias ?? null,
 			accounts: state.accounts.map((account) => {
 				const key = aliasKey(account.alias);

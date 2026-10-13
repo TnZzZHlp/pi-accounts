@@ -1,7 +1,6 @@
-import timers from "node:timers/promises";
-
 import { NoManagedAccountsError } from "./account-manager.js";
-import { CODEX_API, DEFAULT_LIMIT_COOLDOWN_MS } from "./constants.js";
+import { CODEX_API } from "./constants.js";
+import { waitForQuota } from "./quota-wait.js";
 import { createManagedAuth } from "./managed-auth.js";
 
 export const BASE_PROVIDER_SYMBOL = Symbol.for("pi-accounts.base-provider");
@@ -130,28 +129,44 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 		const attemptedAliases = new Set();
 		let startForwarded = false;
 		let lastTerminal;
+		let selectionRevision = manager.selection?.revision;
 		try {
 			signal?.throwIfAborted();
 			if ((await manager.getAccountCount()) === 0) throw new Error("No Codex account is configured; run /account add");
 			while (true) {
 				signal?.throwIfAborted();
+				if (selectionRevision !== manager.selection?.revision) {
+					attemptedAliases.clear();
+					lastTerminal = undefined;
+					selectionRevision = manager.selection?.revision;
+				}
+				const selectionSignal = manager.selection?.signal;
+				const attemptSignal = [signal, selectionSignal].filter(Boolean);
+				const attemptOptionsSignal = attemptSignal.length > 1 ? AbortSignal.any(attemptSignal) : attemptSignal[0];
 				let account;
 				try {
 					account = await manager.prepareAttempt({
 						excludeAliases: attemptedAliases,
 						checkQuota: true,
 						allowExhausted: false,
-						signal: options.signal,
+						signal: attemptOptionsSignal,
 					});
 				} catch (error) {
 					signal?.throwIfAborted();
+					if (selectionSignal?.aborted) continue;
 					if (error instanceof NoManagedAccountsError) {
-						const plan = await manager.getQuotaWaitPlan({ signal });
+						let plan;
+						try {
+							plan = await manager.getQuotaWaitPlan({ signal: attemptOptionsSignal });
+						} catch (waitError) {
+							signal?.throwIfAborted();
+							if (selectionSignal?.aborted) continue;
+							throw waitError;
+						}
+						if (selectionSignal?.aborted) continue;
 						if (plan) {
 							reportWait(plan);
-							const delay = Math.max(1, Math.min(plan.until - manager.now(), DEFAULT_LIMIT_COOLDOWN_MS));
-							await timers.setTimeout(delay, undefined, { signal });
-							await manager.getQuotaWaitPlan({ refresh: true, signal });
+							await waitForQuota(manager, plan, signal, selectionSignal);
 							attemptedAliases.clear();
 							continue;
 						}
@@ -164,6 +179,7 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 					throw error;
 				}
 				signal?.throwIfAborted();
+				if (selectionSignal?.aborted) continue;
 				reportWait(undefined);
 				attemptedAliases.add(account.alias);
 				let responseStatus;
@@ -223,7 +239,8 @@ function relayManagedStream(baseProvider, method, manager, model, context, optio
 				} else if (failureKind === "unavailable") {
 					await manager.noteUnavailable(account.alias, { reason: terminalMessage(terminal) });
 				}
-				if (!failureKind || meaningfulOutput || terminal.reason === "aborted") {
+				if (!failureKind || meaningfulOutput || terminal.reason === "aborted" ||
+					(failureKind === "unavailable" && manager.selection?.mode === "specified")) {
 					relay.push(terminal);
 					relay.end();
 					return;

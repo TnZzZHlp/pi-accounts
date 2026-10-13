@@ -16,8 +16,8 @@ const MODEL = { provider: "openai-codex", id: "gpt-test", api: "openai-codex-res
 const HOUR = 60 * 60_000;
 const FIXTURE = fileURLToPath(new URL("./fixtures/account-process.js", import.meta.url));
 
-async function startProcess(agentDir, origin) {
-	const child = fork(FIXTURE, [agentDir, origin], {
+async function startProcess(agentDir, origin, sessionId) {
+	const child = fork(FIXTURE, [agentDir, origin, ...(sessionId ? [sessionId] : [])], {
 		env: { ...process.env, PI_ACCOUNTS_TEST_PROCESS: "1", PI_CODING_AGENT_DIR: agentDir },
 		stdio: ["ignore", "pipe", "pipe", "ipc"],
 	});
@@ -164,8 +164,8 @@ async function withProcesses(t, run) {
 		await new Promise((resolve) => server.close(resolve));
 		await rm(agentDir, { recursive: true, force: true });
 	});
-	const start = async () => {
-		const child = await startProcess(agentDir, origin);
+	const start = async (sessionId) => {
+		const child = await startProcess(agentDir, origin, sessionId);
 		processes.push(child);
 		return child;
 	};
@@ -183,7 +183,7 @@ async function request(child) {
 	assert.deepEqual(result.events, ["start", "done"]);
 }
 
-test("end-to-end isolates manual and automatic selection across processes and runtime replacements", { timeout: 30_000 }, async (t) => {
+test("end-to-end isolates and persists account modes across sessions, processes, and runtime replacements", { timeout: 30_000 }, async (t) => {
 	await withProcesses(t, async ({ start, store, authPath, requests, failures, used }) => {
 		const first = await start();
 		const second = await start();
@@ -197,49 +197,59 @@ test("end-to-end isolates manual and automatic selection across processes and ru
 		assert.equal((await store.load()).active, "alpha");
 		assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
 
-		for (const reason of ["new", "resume", "reload"]) {
+		for (const reason of ["reload", "new", "resume"]) {
 			const count = requests.length;
-			assert.equal((await second.call("replace", reason)).active, "beta");
+			const restored = await second.call("replace", reason);
+			assert.equal(restored.active, reason === "new" ? "alpha" : "beta");
+			assert.equal(restored.mode, reason === "new" ? "auto" : "specified");
 			assert.equal(requests.length, count);
 			await request(second);
-			assert.equal(responseAccounts(requests, second.pid).at(-1), "beta");
+			assert.equal(responseAccounts(requests, second.pid).at(-1), reason === "new" ? "alpha" : "beta");
 		}
+		const sessionId = second.initial.sessionId;
+		await second.stop();
+		const resumed = await start(sessionId);
+		assert.equal(resumed.initial.mode, "specified");
+		assert.equal(resumed.initial.active, "beta");
+		await request(resumed);
+		assert.equal(responseAccounts(requests, resumed.pid).at(-1), "beta");
 		const restarted = await start();
 		assert.equal(restarted.initial.active, "alpha");
 		assert.equal((await first.call("view")).active, "gamma");
-		assert.equal((await second.call("view")).active, "beta");
+		assert.equal(resumed.initial.active, "beta");
 
+		await first.call("command", "auto");
 		failures.set(`${first.pid}:gamma`, 429);
 		await request(first);
 		assert.deepEqual(responseAccounts(requests, first.pid).slice(-2), ["gamma", "alpha"]);
-		assert.equal((await second.call("view")).active, "beta");
+		assert.equal((await resumed.call("view")).active, "beta");
 		used.set("alpha", 100);
 		assert.equal((await first.call("command", "auto")).active, "beta");
-		assert.equal((await second.call("view")).active, "beta");
+		assert.equal((await resumed.call("view")).active, "beta");
 		assert.equal((await store.load()).active, "alpha");
 
 		await first.call("add", { alias: "delta", credential: createCredential("delta") });
 		assert.equal((await first.call("view")).active, "delta");
-		assert.equal((await second.call("view")).active, "beta");
-		assert.equal((await second.call("view")).accounts.length, 4);
+		assert.equal((await resumed.call("view")).active, "beta");
+		assert.equal((await resumed.call("view")).accounts.length, 4);
 		await first.call("command", "import");
 		assert.equal((await first.call("view")).active, "alpha");
-		assert.equal((await second.call("view")).active, "beta");
+		assert.equal((await resumed.call("view")).active, "beta");
 
 		await first.call("command", "rename beta personal");
-		assert.equal((await second.call("view")).active, "personal");
-		await request(second);
-		assert.equal(responseAccounts(requests, second.pid).at(-1), "beta");
+		assert.equal((await resumed.call("view")).active, "personal");
+		await request(resumed);
+		assert.equal(responseAccounts(requests, resumed.pid).at(-1), "beta");
 		await first.call("command", "remove alpha");
 		assert.equal(await readPiCodexCredential(authPath), undefined);
-		assert.equal((await second.call("view")).active, "personal");
-		await request(second);
-		assert.equal(responseAccounts(requests, second.pid).at(-1), "beta");
+		assert.equal((await resumed.call("view")).active, "personal");
+		await request(resumed);
+		assert.equal(responseAccounts(requests, resumed.pid).at(-1), "beta");
 		assert.deepEqual(JSON.parse(await readFile(authPath, "utf8")).unrelated, { type: "api_key", key: "keep-me" });
 	});
 });
 
-test("end-to-end reports no active account after a peer removes it, then selects the next available account", { timeout: 30_000 }, async (t) => {
+test("end-to-end does not replace a removed specified account until auto mode is explicitly selected", { timeout: 30_000 }, async (t) => {
 	await withProcesses(t, async ({ start, store, authPath, requests, used }) => {
 		used.set("alpha", 100);
 		const first = await start();
@@ -257,13 +267,17 @@ test("end-to-end reports no active account after a peer removes it, then selects
 		const staleSelection = await second.call("ui-list");
 		assert.equal(staleSelection.view.active, null);
 		assert.equal(staleSelection.view.accounts.some((account) => account.active), false);
-		assert.equal(staleSelection.footer, "accounts: no active account selected");
+		assert.equal(staleSelection.view.mode, "specified");
+		assert.equal(staleSelection.footer, "accounts: specified account unavailable; /accounts use or auto");
 
+		await assert.rejects(second.call("request"), /specified Codex account was removed/);
+		assert.deepEqual(responseAccounts(requests, second.pid), []);
+		await second.call("command", "auto");
 		await request(second);
 		const repairedView = await second.call("view");
 		assert.equal(repairedView.active, "gamma");
 		assert.equal(responseAccounts(requests, second.pid).at(-1), "gamma");
-		assert.match((await second.call("ui-list")).footer, /^gamma ·/);
+		assert.match((await second.call("ui-list")).footer, /^auto · gamma ·/);
 		assert.equal((await first.call("view")).active, "alpha");
 		assert.equal((await store.load()).active, "alpha");
 		assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
