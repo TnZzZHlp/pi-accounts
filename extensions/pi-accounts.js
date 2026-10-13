@@ -19,6 +19,7 @@ import {
 } from "./lib/constants.js";
 import { asText, maskEmail, validateAlias } from "./lib/credentials.js";
 import { BASE_PROVIDER_SYMBOL, createManagedProvider } from "./lib/managed-provider.js";
+import { getProcessAccountRuntime } from "./lib/process-state.js";
 import {
 	formatQuotaDetails,
 	formatQuotaStatus,
@@ -46,12 +47,13 @@ function notify(ctx, message, type = "info") {
 }
 
 function activeAccount(view) {
-	return view.accounts.find((account) => account.active) ?? view.accounts[0];
+	return view.accounts.find((account) => account.active);
 }
 
 function formatFooter(view, now = Date.now()) {
 	if (view.accounts.length === 0) return "accounts: /accounts add";
 	const active = activeAccount(view);
+	if (!active) return "accounts: no active account selected";
 	const quota = formatQuotaStatusBar(active.quota, now);
 	if (quota) return `${active.alias} · ${quota}`;
 	if (active.cooldown) {
@@ -170,7 +172,9 @@ function commandHelp() {
 export function createPiAccountsExtension(options = {}) {
 	return function piAccountsExtension(pi) {
 		const agentDir = options.agentDir ?? resolvePiAgentDir(options.env, options.home);
-		const store = options.store ?? new AccountStore(options.storePath ?? join(agentDir, ACCOUNT_STORE_FILENAME));
+		const storePath = options.storePath ?? join(agentDir, ACCOUNT_STORE_FILENAME);
+		const authPath = options.authPath ?? join(agentDir, PI_AUTH_FILENAME);
+		const store = options.store ?? new AccountStore(storePath);
 		let currentContext;
 		let baseProvider;
 		let pollTimer;
@@ -184,7 +188,8 @@ export function createPiAccountsExtension(options = {}) {
 			options.manager ??
 			new AccountManager({
 				store,
-				authPath: options.authPath ?? join(agentDir, PI_AUTH_FILENAME),
+				authPath,
+				runtime: getProcessAccountRuntime(store.path ?? storePath, authPath),
 				fetchImpl: options.fetchImpl,
 				now: options.now,
 				quotaTtlMs: options.quotaTtlMs,

@@ -192,7 +192,7 @@ test("caller cancellation during optional reset-credit details propagates", asyn
 	);
 });
 
-test("automatically rotates from an exhausted active account and syncs auth.json", async () => {
+test("automatically rotates from an exhausted account without switching Pi's shared login", async () => {
 	const alpha = createCredential("alpha");
 	const beta = createCredential("beta");
 	const usedByToken = new Map([
@@ -206,23 +206,24 @@ test("automatically rotates from an exhausted active account and syncs auth.json
 			await manager.use("work");
 			const selected = await manager.ensureReady({ checkQuota: true });
 			assert.equal(selected.alias, "personal");
-			assert.equal((await readPiCodexCredential(authPath)).accountId, "beta");
+			assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
 			const view = await manager.getView();
 			assert.equal(view.active, "personal");
 			assert.equal(view.accounts.find((account) => account.alias === "work").quota.primary.usedPercent, 100);
 		},
-		{ usedByToken },
+		{ usedByToken, auth: { "openai-codex": alpha } },
 	);
 });
 
-test("manual use selects the requested account for the next request", async () => {
-	await withManager(async ({ manager, authPath }) => {
+test("manual use selects the next request's account without changing shared auth", async () => {
+	await withManager(async ({ manager, authPath, storePath }) => {
 		await manager.addCredential(createCredential("alpha"), "alpha");
 		await manager.addCredential(createCredential("beta"), "beta");
 		const selected = await manager.use("alpha");
 		assert.equal(selected.alias, "alpha");
-		assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
-	});
+		assert.equal((await readPiCodexCredential(authPath)).accountId, "beta");
+		assert.equal((await new AccountStore(storePath).load()).active, null);
+	}, { auth: { "openai-codex": createCredential("beta") } });
 });
 
 test("consumes a reset credit for a non-active account and refreshes its cooldown state", async () => {
@@ -255,6 +256,7 @@ test("consumes a reset credit for a non-active account and refreshes its cooldow
 			assert.equal(beta.cooldown, undefined);
 		},
 		{
+			auth: { "openai-codex": createCredential("alpha") },
 			fetchImpl: async (url, init) => {
 				requests.push({ url, init });
 				if (init.method === "POST") {
@@ -377,7 +379,7 @@ test("removing the active account selects the next account and deleting the last
 		assert.equal((await readPiCodexCredential(authPath)).accountId, "alpha");
 		await manager.remove("alpha");
 		assert.equal(await readPiCodexCredential(authPath), undefined);
-	});
+	}, { auth: { "openai-codex": createCredential("alpha") } });
 });
 
 test("serializes rotating OAuth refresh tokens across concurrent Pi processes", async () => {
@@ -421,5 +423,5 @@ test("serializes rotating OAuth refresh tokens across concurrent Pi processes", 
 		assert.equal(first.credential.refresh, "rotated-refresh-alpha");
 		assert.equal(second.credential.refresh, "rotated-refresh-alpha");
 		assert.equal((await readPiCodexCredential(authPath)).refresh, "rotated-refresh-alpha");
-	});
+	}, { auth: { "openai-codex": createCredential("alpha", { expires: NOW - 1 }) } });
 });

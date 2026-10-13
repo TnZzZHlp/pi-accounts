@@ -105,15 +105,20 @@ export async function readPiCodexCredential(authPath) {
 	return normalizeOAuthCredential(credential);
 }
 
-export async function writePiCodexCredential(authPath, credentialValue) {
+export async function syncPiCodexCredential(authPath, accountId, credentialValue) {
 	await updateJsonLocked(authPath, {}, async (raw) => {
 		const auth = asRecord(raw);
 		if (!auth) throw new Error("Invalid auth.json: expected an object");
+		const current = auth[CODEX_PROVIDER];
+		if (current?.type !== "oauth" || getCredentialAccountId(current) !== accountId) return undefined;
 		const next = structuredClone(auth);
 		if (credentialValue === undefined) {
 			delete next[CODEX_PROVIDER];
 		} else {
-			next[CODEX_PROVIDER] = normalizeOAuthCredential(credentialValue);
+			const credential = normalizeOAuthCredential(credentialValue);
+			if (credential.expires < Number(current.expires)) return undefined;
+			if (JSON.stringify(current) === JSON.stringify(credential)) return undefined;
+			next[CODEX_PROVIDER] = credential;
 		}
 		return next;
 	});

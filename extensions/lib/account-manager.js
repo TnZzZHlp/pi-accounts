@@ -16,8 +16,9 @@ import {
 import {
 	findAccount,
 	readPiCodexCredential,
-	writePiCodexCredential,
+	syncPiCodexCredential,
 } from "./account-store.js";
+import { createAccountRuntime } from "./process-state.js";
 import {
 	consumeCodexResetCredit,
 	fetchCodexResetCreditExpiries,
@@ -50,9 +51,9 @@ export class AccountManager {
 		this.refreshSkewMs = options.refreshSkewMs ?? TOKEN_REFRESH_SKEW_MS;
 		this.onChange = options.onChange;
 		this.provider = undefined;
-		this.quota = new Map();
-		this.cooldowns = new Map();
-		this.queue = Promise.resolve();
+		this.runtime = options.runtime ?? createAccountRuntime();
+		this.quota = this.runtime.quota;
+		this.cooldowns = this.runtime.cooldowns;
 	}
 
 	setProvider(provider) {
@@ -70,9 +71,13 @@ export class AccountManager {
 		}
 	}
 
+	get queue() {
+		return this.runtime.queue;
+	}
+
 	_serialized(task) {
-		const run = this.queue.then(task, task);
-		this.queue = run.catch(() => undefined);
+		const run = this.runtime.queue.then(task, task);
+		this.runtime.queue = run.catch(() => undefined);
 		return run;
 	}
 
@@ -84,18 +89,20 @@ export class AccountManager {
 
 	async initialize(options = {}) {
 		return this._serialized(async () => {
-			await this._importCurrent(undefined, { makeActive: false });
+			if (this.runtime.initialized) return this._viewFromState(await this.store.load());
+			await this._importCurrent(undefined, { replaceExisting: false });
 			const state = await this.store.load();
-			if (state.accounts.length === 0) {
-				this._emitChange();
-				return this._viewFromState(state);
+			const current = this._activeAccount(state) ??
+				(state.active ? findAccount(state, state.active) : undefined) ?? state.accounts[0];
+			this.runtime.activeAccountId = current?.accountId ?? null;
+			if (state.accounts.length > 0) {
+				try {
+					await this._select({ checkQuota: options.checkQuota !== false, allowExhausted: true });
+				} catch {
+					if (current) await this._activate(current.alias);
+				}
 			}
-			try {
-				await this._select({ checkQuota: options.checkQuota !== false, allowExhausted: true });
-			} catch {
-				const current = findAccount(state, state.active ?? state.accounts[0].alias);
-				if (current) await this._activate(current.alias);
-			}
+			this.runtime.initialized = true;
 			this._emitChange();
 			return this._viewFromState(await this.store.load());
 		});
@@ -103,7 +110,7 @@ export class AccountManager {
 
 	async importCurrent(alias, options = {}) {
 		return this._serialized(async () => {
-			const account = await this._importCurrent(alias, { makeActive: options.makeActive !== false });
+			const account = await this._importCurrent(alias);
 			if (!account) throw new Error("Pi does not currently have an openai-codex OAuth login to import");
 			if (options.makeActive !== false) await this._activate(account.alias);
 			this._emitChange();
@@ -120,10 +127,11 @@ export class AccountManager {
 			const existing = state.accounts.find((account) => account.accountId === accountId);
 			const now = this.now();
 			if (existing) {
-				existing.credential = { ...credential, accountId };
-				existing.email = getCredentialEmail(credential) ?? existing.email;
-				existing.updatedAt = now;
-				if (!state.active || options.makeActive) state.active = existing.alias;
+				if (options.replaceExisting !== false || credential.expires > existing.credential.expires) {
+					existing.credential = { ...credential, accountId };
+					existing.email = getCredentialEmail(credential) ?? existing.email;
+					existing.updatedAt = now;
+				}
 				return { state, result: existing.alias };
 			}
 			const requestedAlias = alias === undefined ? undefined : validateAlias(alias);
@@ -140,10 +148,11 @@ export class AccountManager {
 				addedAt: now,
 				updatedAt: now,
 			});
-			if (!state.active || options.makeActive) state.active = resolvedAlias;
 			return { state, result: resolvedAlias };
 		});
-		return cloneAccount(findAccount(outcome.state, outcome.result));
+		const account = findAccount(outcome.state, outcome.result);
+		await syncPiCodexCredential(this.authPath, account.accountId, account.credential);
+		return cloneAccount(account);
 	}
 
 	async addCredential(credentialValue, requestedAlias) {
@@ -183,12 +192,12 @@ export class AccountManager {
 						updatedAt: now,
 					});
 				}
-				state.active = resolvedAlias;
 				return { state, result: resolvedAlias };
 			});
 			this.cooldowns.delete(aliasKey(outcome.result));
 			const account = findAccount(outcome.state, outcome.result);
-			await writePiCodexCredential(this.authPath, account.credential);
+			this.runtime.activeAccountId = account.accountId;
+			await syncPiCodexCredential(this.authPath, account.accountId, account.credential);
 			this._emitChange();
 			return cloneAccount(account);
 		});
@@ -245,22 +254,23 @@ export class AccountManager {
 			});
 			this.quota.delete(aliasKey(outcome.result.alias));
 			this.cooldowns.delete(aliasKey(outcome.result.alias));
-			const active = outcome.state.active ? findAccount(outcome.state, outcome.state.active) : undefined;
-			await writePiCodexCredential(this.authPath, active?.credential);
+			if (this.runtime.activeAccountId === outcome.result.accountId) {
+				this.runtime.activeAccountId = outcome.state.accounts[0]?.accountId ?? null;
+			}
+			await syncPiCodexCredential(this.authPath, outcome.result.accountId, undefined);
 			this._emitChange();
 			return cloneAccount(outcome.result);
 		});
 	}
 
+	_activeAccount(state) {
+		return state.accounts.find((account) => account.accountId === this.runtime.activeAccountId);
+	}
+
 	async _activate(alias) {
-		const outcome = await this.store.modify((state) => {
-			const account = findAccount(state, alias);
-			if (!account) throw new Error(`Unknown account: ${alias}`);
-			state.active = account.alias;
-			return { state, result: account.alias };
-		});
-		const account = findAccount(outcome.state, outcome.result);
-		await writePiCodexCredential(this.authPath, account.credential);
+		const account = findAccount(await this.store.load(), alias);
+		if (!account) throw new Error(`Unknown account: ${alias}`);
+		this.runtime.activeAccountId = account.accountId;
 		return account;
 	}
 
@@ -312,9 +322,7 @@ export class AccountManager {
 				return { state, result: current.alias };
 			});
 			const account = findAccount(outcome.state, outcome.result);
-			if (outcome.state.active && aliasKey(outcome.state.active) === aliasKey(account.alias)) {
-				await writePiCodexCredential(this.authPath, account.credential);
-			}
+			await syncPiCodexCredential(this.authPath, account.accountId, account.credential);
 			if (this.cooldowns.get(aliasKey(account.alias))?.kind === "unavailable") {
 				this.cooldowns.delete(aliasKey(account.alias));
 			}
@@ -430,8 +438,7 @@ export class AccountManager {
 	}
 
 	_orderAccounts(state) {
-		if (!state.active) return [...state.accounts];
-		const index = state.accounts.findIndex((account) => aliasKey(account.alias) === aliasKey(state.active));
+		const index = state.accounts.findIndex((account) => account.accountId === this.runtime.activeAccountId);
 		if (index < 0) return [...state.accounts];
 		return [...state.accounts.slice(index), ...state.accounts.slice(0, index)];
 	}
@@ -681,8 +688,9 @@ export class AccountManager {
 	}
 
 	_viewFromState(state) {
+		const active = this._activeAccount(state);
 		return {
-			active: state.active,
+			active: active?.alias ?? null,
 			accounts: state.accounts.map((account) => {
 				const key = aliasKey(account.alias);
 				const quota = this.quota.get(key);
@@ -691,7 +699,7 @@ export class AccountManager {
 					alias: account.alias,
 					accountId: account.accountId,
 					email: account.email,
-					active: !!state.active && aliasKey(state.active) === key,
+					active: account.accountId === active?.accountId,
 					quota: quota?.snapshot,
 					quotaCheckedAt: quota?.checkedAt,
 					quotaError: quota?.error,

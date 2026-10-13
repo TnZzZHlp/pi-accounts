@@ -2,6 +2,7 @@ import timers from "node:timers/promises";
 
 import { NoManagedAccountsError } from "./account-manager.js";
 import { CODEX_API, DEFAULT_LIMIT_COOLDOWN_MS } from "./constants.js";
+import { createManagedAuth } from "./managed-auth.js";
 
 export const BASE_PROVIDER_SYMBOL = Symbol.for("pi-accounts.base-provider");
 
@@ -249,7 +250,7 @@ export function createManagedProvider(providerValue, manager, lifecycle = {}) {
 		name: baseProvider.name,
 		baseUrl: baseProvider.baseUrl,
 		headers: baseProvider.headers,
-		auth: baseProvider.auth,
+		auth: createManagedAuth(baseProvider.auth, manager, lifecycle),
 		getModels: () => baseProvider.getModels(),
 		stream: (model, context, options) =>
 			relayManagedStream(baseProvider, "stream", manager, model, context, options, lifecycle),
