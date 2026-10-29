@@ -105,6 +105,30 @@ export async function readPiCodexCredential(authPath) {
 	return normalizeOAuthCredential(credential);
 }
 
+/**
+ * Unconditionally point auth.json's openai-codex entry at this credential.
+ * Used to repair a lost entry; rotation keeps using syncPiCodexCredential so
+ * Pi's shared login is not switched when managed accounts rotate.
+ */
+export async function writePiCodexCredential(authPath, credentialValue) {
+	const credential = normalizeOAuthCredential(credentialValue);
+	await updateJsonLocked(authPath, {}, async (raw) => {
+		const auth = asRecord(raw);
+		if (!auth) throw new Error("Invalid auth.json: expected an object");
+		const current = auth[CODEX_PROVIDER];
+		if (
+			current?.type === "oauth" &&
+			getCredentialAccountId(current) === getCredentialAccountId(credential) &&
+			JSON.stringify(current) === JSON.stringify(credential)
+		) {
+			return undefined;
+		}
+		const next = structuredClone(auth);
+		next[CODEX_PROVIDER] = credential;
+		return next;
+	});
+}
+
 export async function syncPiCodexCredential(authPath, accountId, credentialValue) {
 	await updateJsonLocked(authPath, {}, async (raw) => {
 		const auth = asRecord(raw);

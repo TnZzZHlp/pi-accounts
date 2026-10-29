@@ -17,6 +17,7 @@ import {
 	findAccount,
 	readPiCodexCredential,
 	syncPiCodexCredential,
+	writePiCodexCredential,
 } from "./account-store.js";
 import { createAccountRuntime } from "./process-state.js";
 import { AccountSelection } from "./account-selection.js";
@@ -110,6 +111,11 @@ export class AccountManager {
 			const current = this._activeAccount(state) ??
 				(state.active ? findAccount(state, state.active) : undefined) ?? state.accounts[0];
 			if (this.selection.mode === "auto") this.selection.activate(current?.accountId ?? null);
+			// Repair a lost auth.json entry: without it Pi starts with the openai-codex
+			// provider unconfigured and session model restore falls back to another model.
+			if (current && !(await readPiCodexCredential(this.authPath))) {
+				await writePiCodexCredential(this.authPath, current.credential);
+			}
 			if (state.accounts.length > 0) {
 				try {
 					await this._select({ checkQuota: options.checkQuota !== false, allowExhausted: true });
