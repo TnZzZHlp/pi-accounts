@@ -26,14 +26,24 @@ const LOCK_OPTIONS = {
 // proper-lockfile can throw ENOENT when another process releases the lock between
 // its stale check and stat, which previously crashed Pi as an uncaught exception.
 async function lockJsonFile(path, options) {
+	let compromised;
+	const lockOptions = {
+		...options,
+		onCompromised: (error) => { compromised = error; },
+	};
 	let release;
 	try {
-		release = await lockfile.lock(path, options);
+		release = await lockfile.lock(path, lockOptions);
 	} catch (error) {
 		if (error?.code !== "ENOENT") throw error;
-		release = await lockfile.lock(path, options);
+		release = await lockfile.lock(path, lockOptions);
 	}
-	return release;
+	return {
+		release,
+		assertHeld() {
+			if (compromised) throw compromised;
+		},
+	};
 }
 
 async function ensureJsonFile(path, fallback, mode) {
@@ -64,7 +74,7 @@ async function parseJsonFile(path) {
 	}
 }
 
-async function atomicWriteJson(path, value, requestedMode) {
+async function atomicWriteJson(path, value, requestedMode, assertHeld) {
 	const parent = dirname(path);
 	const tempPath = join(parent, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
 	let mode = requestedMode;
@@ -81,6 +91,7 @@ async function atomicWriteJson(path, value, requestedMode) {
 		await handle.sync();
 		await handle.close();
 		handle = undefined;
+		assertHeld();
 		await rename(tempPath, path);
 		await chmod(path, mode);
 	} catch (error) {
@@ -93,24 +104,29 @@ async function atomicWriteJson(path, value, requestedMode) {
 export async function readJsonLocked(path, fallback = {}, options = {}) {
 	const mode = options.mode ?? 0o600;
 	await ensureJsonFile(path, fallback, mode);
-	const release = await lockJsonFile(path, LOCK_OPTIONS);
+	const lock = await lockJsonFile(path, LOCK_OPTIONS);
 	try {
-		return await parseJsonFile(path);
+		const current = await parseJsonFile(path);
+		lock.assertHeld();
+		return current;
 	} finally {
-		await release().catch(() => undefined);
+		await lock.release().catch(() => undefined);
 	}
 }
 
 export async function updateJsonLocked(path, fallback, update, options = {}) {
 	const mode = options.mode ?? 0o600;
 	await ensureJsonFile(path, fallback, mode);
-	const release = await lockJsonFile(path, LOCK_OPTIONS);
+	const lock = await lockJsonFile(path, LOCK_OPTIONS);
 	try {
 		const current = await parseJsonFile(path);
+		lock.assertHeld();
 		const next = await update(current);
-		if (next !== undefined) await atomicWriteJson(path, next, mode);
+		lock.assertHeld();
+		if (next !== undefined) await atomicWriteJson(path, next, mode, lock.assertHeld);
+		lock.assertHeld();
 		return next === undefined ? current : next;
 	} finally {
-		await release().catch(() => undefined);
+		await lock.release().catch(() => undefined);
 	}
 }

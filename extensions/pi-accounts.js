@@ -210,10 +210,11 @@ export function createPiAccountsExtension(options = {}) {
 		}
 
 		async function updateAccountStatus(ctx) {
-			if (ctx.hasUI === false || shuttingDown) return undefined;
+			const signal = sessionController?.signal;
 			try {
+				if (shuttingDown || signal?.aborted || ctx.hasUI === false) return undefined;
 				const text = formatAccountStatus(await manager.getView(), now());
-				if (shuttingDown) return undefined;
+				if (shuttingDown || signal?.aborted) return undefined;
 				if (ctx.mode === "tui") {
 					ctx.ui.setWidget(STATUS_KEY, [text], { placement: "belowEditor" });
 					ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -229,12 +230,17 @@ export function createPiAccountsExtension(options = {}) {
 			}
 		}
 
-		function refreshAccountStatusInBackground(ctx) {
+		function refreshAccountStatusInBackground() {
+			const signal = sessionController?.signal;
+			if (shuttingDown || signal?.aborted || !currentContext) return;
 			const selectionSignal = manager.selection?.signal;
-			void manager.refreshAll({ force: false }).then(() => updateAccountStatus(ctx)).catch((error) => {
-				if (shuttingDown || (selectionSignal?.aborted && error?.name === "AbortError")) return;
+			void manager.refreshAll({ force: false, signal }).then(() => {
+				if (shuttingDown || signal?.aborted || !currentContext) return;
+				return updateAccountStatus(currentContext);
+			}).catch((error) => {
+				if (shuttingDown || signal?.aborted || !currentContext || (selectionSignal?.aborted && error?.name === "AbortError")) return;
 				const message = error instanceof Error ? error.message : String(error);
-				notify(ctx, `Codex quota refresh failed: ${message}`, "warning");
+				notify(currentContext, `Codex quota refresh failed: ${message}`, "warning");
 			});
 		}
 
@@ -662,7 +668,8 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("session_start", async (_event, ctx) => {
 			sessionController?.abort();
-			sessionController = new AbortController();
+			const controller = new AbortController();
+			sessionController = controller;
 			shuttingDown = false;
 			currentContext = ctx;
 			apiRateLimits = undefined;
@@ -675,22 +682,27 @@ export function createPiAccountsExtension(options = {}) {
 			try {
 				manager.setProvider(baseProvider);
 				await manager.restoreSelection(ctx);
+				if (controller.signal.aborted) return;
 				await manager.initialize({ checkQuota: true });
+				if (controller.signal.aborted) return;
 				pi.registerProvider(createManagedProvider(baseProvider, manager, {
-					signal: sessionController.signal,
+					signal: controller.signal,
 					onWait: (plan) => {
-						if (!currentContext || currentContext.hasUI === false || shuttingDown) return;
+						if (shuttingDown || controller.signal.aborted || !currentContext || currentContext.hasUI === false) return;
 						currentContext.ui.setStatus("pi-accounts-wait", plan
 							? `Codex waiting: ${plan.alias} · ${formatRemainingTime(plan.until - now())} · ${plan.knownReset ? "expected reset" : "next quota check"} ${new Date(plan.until).toLocaleString()} · Esc to cancel`
 							: undefined);
 					},
 				}));
 				await refreshModelRegistry(ctx);
+				if (controller.signal.aborted) return;
 				await updateAccountStatus(ctx);
+				if (controller.signal.aborted) return;
 				if (pollTimer) clearInterval(pollTimer);
-				pollTimer = setInterval(() => refreshAccountStatusInBackground(ctx), options.pollIntervalMs ?? QUOTA_POLL_INTERVAL_MS);
+				pollTimer = setInterval(refreshAccountStatusInBackground, options.pollIntervalMs ?? QUOTA_POLL_INTERVAL_MS);
 				pollTimer.unref?.();
 			} catch (error) {
+				if (controller.signal.aborted) return;
 				notify(ctx, `pi-accounts initialization failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 				await updateAccountStatus(ctx);
 			}
@@ -729,11 +741,12 @@ export function createPiAccountsExtension(options = {}) {
 
 		pi.on("agent_end", (_event, ctx) => {
 			currentContext = ctx;
-			if (isCodexModel(ctx.model)) refreshAccountStatusInBackground(ctx);
+			if (isCodexModel(ctx.model)) refreshAccountStatusInBackground();
 		});
 
 		pi.on("session_shutdown", (_event, ctx) => {
 			shuttingDown = true;
+			currentContext = undefined;
 			sessionController?.abort();
 			apiRateLimits = undefined;
 			if (pollTimer) clearInterval(pollTimer);

@@ -9,6 +9,60 @@ import { AccountStore } from "../extensions/lib/account-store.js";
 import { createPiAccountsExtension, resolvePiAgentDir } from "../extensions/pi-accounts.js";
 import { createCredential, NOW, quotaPayload } from "./helpers.js";
 
+test("does not resume initialization with a stale context after shutdown", async () => {
+	const agentDir = await mkdtemp(join(tmpdir(), "pi-accounts-shutdown-"));
+	const events = new Map();
+	const providers = [];
+	const started = Promise.withResolvers();
+	const response = Promise.withResolvers();
+	let stale = false;
+	let staleAccesses = 0;
+	const ctx = {
+		get hasUI() {
+			if (stale) {
+				staleAccesses++;
+				throw new Error("stale context");
+			}
+			return false;
+		},
+		modelRegistry: {
+			getProvider: () => ({ auth: { oauth: {} } }),
+			refresh: async () => {
+				assert.equal(stale, false);
+			},
+		},
+	};
+	try {
+		await writeFile(join(agentDir, "auth.json"), JSON.stringify({
+			"openai-codex": createCredential("alpha"),
+		}), { mode: 0o600 });
+		createPiAccountsExtension({
+			agentDir,
+			now: () => NOW,
+			fetchImpl: async () => {
+				started.resolve();
+				return response.promise;
+			},
+		})({
+			on: (name, handler) => events.set(name, handler),
+			registerCommand() {},
+			registerProvider: (provider) => providers.push(provider),
+		});
+		const initialization = events.get("session_start")({}, ctx);
+		await started.promise;
+		events.get("session_shutdown")({}, ctx);
+		stale = true;
+		response.resolve({ ok: true, status: 200, json: async () => quotaPayload(20) });
+		await initialization;
+		assert.equal(staleAccesses, 0);
+		assert.equal(providers.length, 0);
+	} finally {
+		response.resolve({ ok: false, status: 503 });
+		events.get("session_shutdown")?.({}, { hasUI: false });
+		await rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 test("registers commands and drives account management through the interactive TUI", async () => {
 	const agentDir = await mkdtemp(join(tmpdir(), "pi-accounts-extension-"));
 	const alpha = createCredential("alpha", { email: "alpha@example.com" });
